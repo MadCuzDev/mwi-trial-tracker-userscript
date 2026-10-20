@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MWI Trial Tracker
 // @namespace    http://tampermonkey.net/
-// @version      1.36.1
+// @version      1.36.2
 // @description  Tracks and optimizes trials  on milkywayidle.
 // @author       MadCuzDev, Rhohydronian
 // @match        https://www.milkywayidle.com/*
@@ -159,7 +159,7 @@
   // the @version metadata above — bump BOTH on every release (even tiny ones;
   // the third digit is for super-small changes), or the member list will show
   // the wrong "latest" comparison.
-  const SCRIPT_VERSION = "1.36.1";
+  const SCRIPT_VERSION = "1.36.2";
 
   // All 17 MWI skills: the 10 skilling skills plus the 7 combat stats.
   // `icon` is rendered next to each skill in the roster overlay header and
