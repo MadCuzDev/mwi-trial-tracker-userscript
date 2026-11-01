@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MWI Trial Tracker
 // @namespace    http://tampermonkey.net/
-// @version      1.36.2
+// @version      1.36.3
 // @description  Tracks and optimizes trials  on milkywayidle.
 // @author       MadCuzDev, Rhohydronian
 // @match        https://www.milkywayidle.com/*
@@ -159,7 +159,7 @@
   // the @version metadata above — bump BOTH on every release (even tiny ones;
   // the third digit is for super-small changes), or the member list will show
   // the wrong "latest" comparison.
-  const SCRIPT_VERSION = "1.36.2";
+  const SCRIPT_VERSION = "1.36.3";
 
   // All 17 MWI skills: the 10 skilling skills plus the 7 combat stats.
   // `icon` is rendered next to each skill in the roster overlay header and
@@ -254,7 +254,12 @@
       // user opts out via the panel checkbox. Same defensive default-true
       // pattern as fabLocked: a fresh install gets no stored value at all,
       // so GM_getValue returns the `true` default and coercion keeps it on.
-      autoSyncEnabled: stlGetValue("autoSyncEnabled", true)
+      autoSyncEnabled: stlGetValue("autoSyncEnabled", true),
+      // v1.37.0: the per-character master switch — the character IDs (a clean
+      // numeric array) for which the tracker is fully OFF. The Android
+      // bridge can hand the stored value back as a JSON string, so this is
+      // always run through normalizeDisabledCharacterIds (see below).
+      disabledCharacterIds: getDisabledCharacterIds()
     };
     // The Android app's GM storage is string-only: numbers and booleans come
     // back as strings ("12345", "true", "false"). Left raw, a string like
@@ -285,6 +290,11 @@
     if (partial.overlayPosition !== undefined) stlSetValue("overlayPosition", partial.overlayPosition);
     if (partial.overlayPillPosition !== undefined) stlSetValue("overlayPillPosition", partial.overlayPillPosition);
     if (partial.autoSyncEnabled !== undefined) stlSetValue("autoSyncEnabled", partial.autoSyncEnabled);
+    // v1.37.0: the per-character off list — always persisted as a clean
+    // numeric array (normalize drops junk values and dedupes).
+    if (partial.disabledCharacterIds !== undefined) {
+      stlSetValue("disabledCharacterIds", normalizeDisabledCharacterIds(partial.disabledCharacterIds));
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -333,6 +343,84 @@
         ? detectedCharacterName
         : (stlGetValue("detectedCharacterName", "") || cfg.characterName);
     return { characterId: id, characterName: name };
+  }
+
+  // ---------------------------------------------------------------------
+  // v1.37.0 — Per-character master switch.
+  //
+  // The tracker can be switched OFF for individual characters (keyed by
+  // character ID, as resolved above — live detection first). For any
+  // character in the disabled list the tracker does NOTHING in the page:
+  // no WebSocket level capture, no level/profile/trial pushes (manual,
+  // auto-sync, or guild), no optimizer plan fetches, no trial highlight or
+  // notice, no update banner, no floating button, no panel, no overlay,
+  // no Tampermonkey-menu action.
+  //
+  // The in-game Settings → Trial Tracker tab is deliberately the ONE thing
+  // that keeps working: it is the escape hatch that turns the tracker back
+  // on for that character (applyTrackerState re-arms everything, no
+  // reload).
+  //
+  // Identity capture still runs while disabled — the game's
+  // init_character_data is how the script learns WHICH character is logged
+  // in (and that an in-page character switch happened), which is exactly
+  // what the switch keys on.
+  //
+  // Persistence rides the usual GM store + localStorage mirror, so the
+  // switch survives Android app relaunches (where the raw GM copy is
+  // wiped) like every other setting.
+  // ---------------------------------------------------------------------
+  // Normalize whatever storage returned (a real array in Tampermonkey, a
+  // JSON string from the Android webview bridge) into a clean numeric ID
+  // list: numbers only, positive, deduped, order preserved.
+  function normalizeDisabledCharacterIds(raw) {
+    let list = raw;
+    if (typeof raw === "string") {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) list = parsed;
+      } catch (e) {
+        return []; // unparseable — treat as empty rather than junk
+      }
+    }
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const entry of list) {
+      const id = Number(entry);
+      if (Number.isInteger(id) && id > 0 && !out.includes(id)) out.push(id);
+    }
+    return out;
+  }
+  function getDisabledCharacterIds() {
+    return normalizeDisabledCharacterIds(stlGetValue("disabledCharacterIds", null));
+  }
+  // True when the numeric character ID `id` is in the off list. A null or
+  // otherwise unresolved ID can never be off — the switch has nothing to
+  // key on until the game identifies the character.
+  function isCharacterDisabled(id) {
+    return Number.isInteger(id) && id > 0 && getDisabledCharacterIds().includes(id);
+  }
+  // The switch state for the character this browser is acting as right now.
+  function trackerDisabled() {
+    return isCharacterDisabled(resolveCharacter().characterId);
+  }
+  // Add/remove `id` in the off list, persist it, and re-apply the tracker
+  // state (the flip is what strips or re-arms everything in the page).
+  // No-op when the list already reflects `disabled` for that ID.
+  function setCharacterDisabled(id, disabled) {
+    const idNum = Number(id);
+    if (!Number.isInteger(idNum) || idNum <= 0) return false;
+    const ids = getDisabledCharacterIds();
+    const at = ids.indexOf(idNum);
+    if (disabled && at === -1) {
+      ids.push(idNum);
+      stlSetValue("disabledCharacterIds", ids);
+    } else if (!disabled && at !== -1) {
+      ids.splice(at, 1);
+      stlSetValue("disabledCharacterIds", ids);
+    }
+    applyTrackerState();
+    return true;
   }
 
   // ---------------------------------------------------------------------
@@ -548,6 +636,17 @@
   // ignored — the game sends a lot of unrelated traffic.
   function handleGameMessage(data) {
     if (!data || typeof data !== "object") return;
+    // v1.37.0: identity capture runs even when the tracker is switched off
+    // for this character — init_character_data is how the script learns
+    // WHO is logged in, which is what the per-character off switch keys on
+    // (and what makes an in-page character switch re-evaluate it).
+    if (data.type === "init_character_data" && data.character && typeof data.character === "object") {
+      rememberCharacter(data.character.id, data.character.name);
+      applyTrackerState();
+    }
+    // Everything else the tracker does — skill capture, guild roster,
+    // trial pushes, auto-sync — is off for a disabled character.
+    if (trackerDisabled()) return;
     switch (data.type) {
       case "init_character_data":
         if (data.character && typeof data.character === "object") {
@@ -1411,6 +1510,10 @@
   }
 
   function sweep() {
+    // v1.37.0: a disabled character gets none of the sweep's work (plan
+    // fetch, highlight, panel observation, auto-sync). The re-enable path
+    // calls sweep() itself, so the first tick after re-enabling catches up.
+    if (trackerDisabled()) return;
     readLevelsFromSidebar();
     // Belt-and-suspenders (2026-10-20): if the in-flight plan fetch has been
     // held far beyond the request timeout, its promise never settled (the
@@ -1550,6 +1653,14 @@
   function renderUpdateReminder() {
     const banner = document.getElementById("stl-update-banner");
     const dot = document.getElementById("stl-fab-update-dot");
+    // v1.37.0: a disabled character hides the banner AND the FAB dot,
+    // whatever the version state is — the tracker is off, so its update
+    // nag is off too. (A re-enable repaints this from the stored state.)
+    if (trackerDisabled()) {
+      if (banner) banner.hidden = true;
+      if (dot) dot.hidden = true;
+      return;
+    }
     const dismissed = stlGetValue("stlDismissedUpdateVersion", null);
     const outdated =
       updateLatest != null &&
@@ -1719,12 +1830,74 @@
     return null;
   }
 
+  // The latest plan's member set is built server-side from the synced guild
+  // profiles: the union of every per-skill assignment list, the named
+  // unassigned pool (meta.unassigned), and the admin-excluded members
+  // (meta.excluded). A character outside the guild — e.g. an ironcow alt
+  // that never pushed a profile to the ledger — is in none of those lists
+  // even though a plan exists, which made it look "not assigned" and
+  // surfaced the "No suitable trial found" sit-out notice for it
+  // (2026-10-30: reported by ironcow accounts that aren't in the guild).
+  // applyNoTrialNotice() consults this test before painting that notice.
+  //
+  // Returns:
+  //   true  — the character is in the plan's member set (assigned,
+  //           unassigned, or excluded);
+  //   false — a modern plan (carries the unassigned/excluded lists) and
+  //           the character is in none of them — a non-member, suppress;
+  //   null  — undecidable: no plan yet, or a legacy plan without the
+  //           membership lists — callers keep the pre-fix behavior, since
+  //           a sitting-out member can't be distinguished from a
+  //           non-member on those plans.
+  function characterInPlanMemberSet() {
+    if (!latestPlan) return null;
+    const { characterId, characterName } = resolveCharacter();
+    const hasId = characterId != null;
+    const name = String(characterName || "").trim().toLowerCase();
+    // Id match first, case-insensitive name match only when no id is known
+    // (same semantics as isInGuildRoster()). Tolerates both the
+    // optimizer's member objects ({ characterId, name, ... }) and raw ids.
+    const inList = (list) => {
+      if (!Array.isArray(list)) return false;
+      if (hasId) {
+        for (const entry of list) {
+          const cid = entry && typeof entry === "object" ? entry.characterId : entry;
+          if (cid != null && Number(cid) === Number(characterId)) return true;
+        }
+        return false; // an id is authoritative — never fall back to name guessing
+      }
+      if (!name) return false;
+      for (const entry of list) {
+        const n = entry && typeof entry === "object" ? entry.name : null;
+        if (n && String(n).trim().toLowerCase() === name) return true;
+      }
+      return false;
+    };
+    const meta = latestPlan.meta && typeof latestPlan.meta === "object" ? latestPlan.meta : {};
+    // The server writes both lists on every run (manual and auto); plans
+    // saved before that carry only the assignments, which can't identify
+    // the run's unassigned (sitting-out) members.
+    const modern = Array.isArray(meta.unassigned) || Array.isArray(meta.excluded);
+    const lists = [];
+    const assignments = latestPlan.assignments || {};
+    for (const key of Object.keys(assignments)) lists.push(assignments[key]);
+    lists.push(meta.unassigned, meta.excluded);
+    for (const list of lists) {
+      if (inList(list)) return true;
+    }
+    return modern ? false : null;
+  }
+
   // Panel notice for two distinct failure states, painted at the top of
   // the trials panel so it is visible as soon as the panel opens:
-  //   (a) "sit out" — the latest optimizer run exists but this character is
-  //       in no assignment (excluded members surface the same way: they are
+  //   (a) "sit out" — the latest optimizer run exists, this character is
+  //       in the plan's member set (characterInPlanMemberSet()), and is in
+  //       no assignment (excluded members surface the same way: they are
   //       skipped before assignment, so they are simply absent from every
-  //       assignments[skill] array);
+  //       assignments[skill] array). 2026-10-30: the membership gate —
+  //       a character in NO plan list (e.g. an ironcow account that isn't
+  //       in the guild and never synced a profile) is not sitting out;
+  //       it simply has nothing to sit out of, so it gets no notice.
   //   (b) "ledger unreachable" (2026-10-20) — the plan fetch never reached
   //       a verdict (planState "unknown" after an attempt). Before this, a
   //       wedged/broken network looked exactly like "no plan yet" and said
@@ -1736,8 +1909,16 @@
     const characterId = resolveCharacterId();
     const unreachable =
       planState === "unknown" && planFetchAttempted && characterId != null;
+    // 2026-10-30: the sit-out notice applies only to a character in the
+    // plan's member set. An unassigned character outside the guild (an
+    // ironcow alt that never synced a profile) is in no list at all —
+    // characterInPlanMemberSet() reports false and the notice is
+    // suppressed. null (legacy plan, membership unknowable) keeps the
+    // pre-fix behavior of showing the notice.
+    const membership = characterInPlanMemberSet();
     const shouldShow =
-      unreachable || (latestPlan !== null && bestSkill === null);
+      unreachable ||
+      (latestPlan !== null && bestSkill === null && membership !== false);
     const message = unreachable
       ? "Ledger unreachable \u2014 can't load the optimizer plan. The highlight will appear once the ledger is back."
       : "No suitable trial found \u2014 sit this round out or ask a general.";
@@ -1779,6 +1960,20 @@
   }
 
   function applyTrialHighlight(preferredPanel) {
+    // v1.37.0: a disabled character paints nothing. Late callbacks that
+    // outlive a switch-off (a plan fetch still in flight, a retry tick,
+    // the panel observer) all funnel through here, so this guard strips
+    // whatever the tracker last painted and paints nothing back.
+    if (trackerDisabled()) {
+      if (appliedHighlight || document.querySelector(".stl-trial-badge")) {
+        clearTrialHighlightMarks();
+      }
+      appliedHighlight = null;
+      const notice = document.getElementById("stl-trial-notice");
+      if (notice) notice.remove();
+      appliedNoTrialNotice = null;
+      return false;
+    }
     const bestSkill = findAssignedTrialSkill();
     // Keep the "no suitable trial" notice in sync with the same state.
     applyNoTrialNotice(preferredPanel, bestSkill);
@@ -1869,6 +2064,13 @@
   // ---------------------------------------------------------------------
   function runHighlightRetry() {
     highlightRetryTimer = null;
+    // v1.37.0: the character was switched off mid-retry — drop the chain
+    // so a late tick can't repaint a disabled character's panel.
+    if (trackerDisabled()) {
+      highlightRetryCount = 0;
+      highlightRetryPanel = null;
+      return;
+    }
     if (!highlightRetryPanel || !highlightRetryPanel.isConnected) return;
     // applyTrialHighlight is idempotent: it only touches the DOM when the
     // highlight actually changed, so repeated ticks stay cheap.
@@ -2804,6 +3006,7 @@
   }
 
   async function maybeAutoSync() {
+    if (trackerDisabled()) return; // v1.37.0: off for this character
     if (!cfgGet().autoSyncEnabled) return;
     if (detectedCharacterId === null) return; // no identity captured yet
     const apiBase = cfgGet().apiBase.replace(/\/$/, "");
@@ -3029,6 +3232,18 @@
     #stlt-autosync-status { margin-top: 4px; font-size: 11px; color: #b7b9cc; font-family: system-ui, sans-serif; }
     #stlt-autosync-status.ok { color: #35c25a; }
     #stlt-autosync-status.err { color: #e2564a; }
+    /* v1.37.0: the per-character "tracker is OFF" state — an amber note
+       above the re-enable control in the in-game Settings tab (the one UI
+       the switch can never remove: it is the escape hatch back on). */
+    #stlt-disabled-note {
+      margin: 10px 0 6px; padding: 8px 10px; border-radius: 6px;
+      border: 1px solid rgba(245, 197, 66, 0.45);
+      background: rgba(120, 96, 20, 0.25);
+      color: #ffe08a; font-size: 12px; line-height: 1.45;
+      font-family: system-ui, sans-serif; text-transform: none; letter-spacing: 0;
+    }
+    #stlt-disabled-note:empty { display: none; }
+    #stlt-enabled { transform: scale(1.2); cursor: pointer; }
     #stl-panel {
       position: fixed; bottom: 70px; right: 20px; z-index: 999999;
       /* v1.36.0: responsive width — capped at 300px (desktop) but shrinks to
@@ -3145,6 +3360,7 @@
     #stl-autosync-status.err { color: #e2564a; }
     #stl-login { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 8px 10px 10px; margin-bottom: 10px; background: rgba(255,255,255,0.02); }
     #stl-login label { margin-top: 0; }
+    #stl-login .stl-login-optional { font-size: 11px; font-style: italic; color: #b7b9cc; margin: 0 0 6px; }
     #stl-login-detected { font-size: 11px; color: #b7b9cc; margin: 6px 0 2px; }
     #stl-login-code { font-size: 16px; font-weight: 600; text-align: center; }
     #stl-login-actions { display: flex; gap: 8px; margin-top: 8px; }
@@ -3716,6 +3932,9 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       "hideUpdateFab", "fabLocked", "fabPosition", "panelLocked",
       "panelPosition", "overlayPosition", "overlayPillPosition",
       "allowPushOutsideGuild", "autoSyncEnabled",
+      // v1.37.0: the per-character off list — a reset re-enables every
+      // character that had been switched off.
+      "disabledCharacterIds",
       "detectedCharacterId", "detectedCharacterName",
       "autoSyncLastAt", "autoSyncLastCharId",
       "stlDismissedUpdateVersion"
@@ -3746,6 +3965,11 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       fab.style.bottom = "";
       fab.style.transform = "";
     }
+    // v1.37.0: the reset also clears the per-character off list, so a
+    // character that had been switched off is re-enabled — re-apply the
+    // tracker state (no-op when nothing flipped) before the panel rebuild
+    // so `wasOpen` reflects the post-reset UI.
+    applyTrackerState();
     rebuildOpenPanel();
     return baseKeys.length + SKILLS.length;
   }
@@ -3784,9 +4008,10 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
 
     const panel = document.createElement("div");
     panel.id = "stl-panel";
-    // v1.36.0: the panel has two views — Main (login, levels, sync actions)
-    // and Settings (Save, API base URL, read-only character ID/name,
-    // auto-sync, fab lock, Reset) — switched via the nav under the title.
+    // v1.36.0: the panel has two views — Main (levels, sync actions)
+    // and Settings (Save, API base URL, optional ledger-site login,
+    // read-only character ID/name, auto-sync, fab lock, Reset) —
+    // switched via the nav under the title.
     // Each view replaces the other's content entirely (top-to-bottom:
     // title, nav, view content, shared status line).
     panel.innerHTML = `
@@ -3804,16 +4029,6 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
           <button class="stl-update-dismiss" type="button"
             title="Hide this reminder until the next version">Dismiss</button>
         </div>
-        <div id="stl-login">
-          <label>Log in to the ledger site (MWI)</label>
-          <div id="stl-login-detected"></div>
-          <input id="stl-login-code" type="text" maxlength="8" placeholder="CODE FROM SITE"
-                 autocomplete="off" spellcheck="false" style="text-transform: uppercase; letter-spacing: 0.18em;" />
-          <div id="stl-login-actions">
-            <button id="stl-login-confirm" type="button">Confirm login</button>
-          </div>
-          <div id="stl-login-status"></div>
-        </div>
         <label>Levels</label>
         <div id="stl-skills"></div>
         <div id="stl-actions">
@@ -3829,6 +4044,21 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         </details>
       </div>
       <div id="stl-view-settings-content" hidden>
+        <!-- v1.36.3: the ledger-site login moved here out of the Tracker view
+             so it isn't the first thing users see — and it sits next to the
+             API base URL it needs to work. Explicitly marked optional: the
+             tracker (levels, sync, roster, auto-sync) works fully without it. -->
+        <div id="stl-login">
+          <label>Log in to the website — OPTIONAL</label>
+          <div class="stl-login-optional">Tracker works without an account. The site access stays read-only unless you're an admin.</div>
+          <div id="stl-login-detected"></div>
+          <input id="stl-login-code" type="text" maxlength="8" placeholder="CODE FROM SITE"
+                 autocomplete="off" spellcheck="false" style="text-transform: uppercase; letter-spacing: 0.18em;" />
+          <div id="stl-login-actions">
+            <button id="stl-login-confirm" type="button">Confirm login</button>
+          </div>
+          <div id="stl-login-status"></div>
+        </div>
         <div id="stl-actions">
           <button id="stl-save" type="button">Save settings</button>
         </div>
@@ -3840,6 +4070,15 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         <input id="stl-characterId" type="number" value="${characterId}" readonly />
         <label>Character name</label>
         <input id="stl-characterName" type="text" value="${characterName}" readonly />
+        <!-- v1.37.0: per-character master switch — the same stored state
+             as the in-game Settings tab's copy (#stlt-enabled). OFF means
+             the tracker does nothing FOR THIS CHARACTER ONLY (keyed by
+             character ID); the in-game Settings tab stays as the escape
+             hatch to turn it back on. -->
+        <label class="stl-check" title="Turn the whole trial tracker on or off for THIS character only (keyed by character ID — every other character in this browser is unaffected). Off means no button, no auto-sync, no trial highlight; turn it back on here or from the in-game Settings → Trial Tracker tab.">
+          <input id="stl-settings-enabled" type="checkbox" />
+          Enable the trial tracker for this character
+        </label>
         <label class="stl-check" title="Automatically push this character's levels and profile to the ledger when the game opens and every 30 minutes (a 30-minute cooldown prevents reload spam)">
           <input id="stl-autosync" type="checkbox" ${cfg.autoSyncEnabled ? "checked" : ""} />
           Auto-sync this character (on open + every 30 min)
@@ -3998,7 +4237,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     loginBtn.addEventListener("click", async () => {
       const apiBase = panel.querySelector("#stl-apiBase").value.trim().replace(/\/$/, "");
       if (!apiBase) {
-        setLoginStatus("Set the API base URL in the Settings view first.", "err");
+        setLoginStatus("Set the API base URL above first.", "err");
         return;
       }
       const code = loginCode.value.trim().toUpperCase();
@@ -4088,9 +4327,15 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     const showFabToggle = panel.querySelector("#stl-settings-show-fab");
     const fabLockToggle = panel.querySelector("#stl-settings-fab-lock");
     const panelLockToggle = panel.querySelector("#stl-settings-panel-lock");
+    // v1.37.0: the per-character master switch (mirrors #stlt-enabled in
+    // the in-game Settings tab).
+    const enabledToggle = panel.querySelector("#stl-settings-enabled");
     let activeView = "main";
 
     function syncSettingsUi() {
+      // v1.37.0: the per-character master switch (mirrors #stlt-enabled in
+      // the in-game Settings tab).
+      enabledToggle.checked = !trackerDisabled();
       // hideUpdateFab defaults to false → button shown (checkbox = "show").
       showFabToggle.checked = cfgGet().hideUpdateFab !== true; // default: shown
       fabLockToggle.checked = cfgGet().fabLocked !== false; // default: locked
@@ -4123,7 +4368,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     // never resizes the panel. The panel is height:auto (CSS), so dropping
     // the inline height measures the auto-sized (Main) value, which we then
     // re-apply inline so it holds for the Settings view too. Re-measured
-    // whenever the Main view's content changes (e.g. the login block
+    // whenever the Main view's content changes (e.g. the update banner
     // appearing/hiding) via a ResizeObserver on the Main view's content —
     // that's what actually changes size, since the panel's own rendered
     // height stays pinned.
@@ -4168,6 +4413,37 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         );
       }
       syncSettingsUi();
+    });
+
+    // v1.37.0: per-character master switch (mirrors the in-game Settings
+    // tab's #stlt-enabled). Switching OFF strips everything in the page —
+    // setCharacterDisabled → applyTrackerState closes this panel and
+    // removes the button — so a confirmation line is only ever seen on a
+    // re-enable (switching off leaves no panel to show it in).
+    enabledToggle.addEventListener("change", (event) => {
+      const { characterId, characterName } = resolveCharacter();
+      if (!Number.isInteger(characterId) || characterId <= 0) {
+        setStatus("No character ID detected yet — log in to the game first, then toggle this.", "err");
+        syncSettingsUi();
+        return;
+      }
+      const enable = event.target.checked;
+      // v1.37.0: confirm before flipping the master switch — off carries a
+      // warning (it strips everything the tracker does in this page).
+      const who = characterName ? `${characterName} (ID ${characterId})` : `ID ${characterId}`;
+      const message = enable
+        ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's optimizer pick.`
+        : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the optimizer-pick / sit-out highlight and update button all go away. You can turn it back on anytime from Settings → Trial Tracker.`;
+      if (!window.confirm(message)) {
+        enabledToggle.checked = !enable; // cancel: put the switch back
+        return;
+      }
+      setCharacterDisabled(characterId, !enable);
+      if (!trackerDisabled()) {
+        setStatus("Trial tracker enabled for this character.", "ok");
+      }
+      const t = document.getElementById("stlt-enabled"); // keep the tab in sync
+      if (t) t.checked = enable;
     });
 
     fabLockToggle.addEventListener("change", (event) => {
@@ -4477,6 +4753,98 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   let stlTabActive = false;
   let settingsTabWatcher = null;
   let settingsWiring = null; // { container, tabHost, panelsHost, tab }
+  // v1.37.0: while our tab is active, re-run the idempotent hide pass on a
+  // short tick. Field evidence: in long sessions the game re-renders the
+  // Settings page (and Toolasha can re-inject its panel) — React's re-render
+  // rewrites the panels' inline `style`, clobbering the one-shot
+  // `display:none !important` we set at click time, so the leak comes back
+  // until the next mutation happens to trigger the MutationObserver
+  // self-heal ("sometimes it self-heals"). A 400ms guard makes the hide
+  // continuous instead of event-driven. reassertHiddenBuiltins is fully
+  // idempotent (it only writes when something is actually wrong), so an
+  // idle tick causes zero DOM churn and therefore no observer feedback loop.
+  let stlHideGuard = null; // setInterval id, or null
+  let styleClobberWatcher = null; // MutationObserver (style attrs) on the Settings page
+  let settingsClickAttached = false; // one-shot document-level tab-click listener
+  function startStlHideGuard() {
+    if (stlHideGuard != null || !stlTabActive) return;
+    stlHideGuard = setInterval(() => {
+      if (!stlTabActive) {
+        stopStlHideGuard();
+        return;
+      }
+      try {
+        if (findSettingsTabContainer()) reassertHiddenBuiltins();
+      } catch (e) {
+        // Never let a guard tick take the page down.
+      }
+    }, 400);
+  }
+  function stopStlHideGuard() {
+    if (stlHideGuard != null) {
+      clearInterval(stlHideGuard);
+      stlHideGuard = null;
+    }
+  }
+
+  // v1.37.0 (follow-up to the 400ms guard): the interval only CORRECTS a
+  // clobber after the fact, so a re-render that rewrites a panel's inline
+  // style (a React re-render of the tab panels does exactly this, WITHOUT
+  // any childList change) leaves a visible flash window of up to one tick
+  // where the foreign panel paints under our tab. This observer closes the
+  // window: it watches the Settings page for `style` attribute rewrites and
+  // re-asserts within the same task as the clobber — before any paint.
+  // reassertHiddenBuiltins is fully idempotent (it only writes when
+  // something is actually wrong), so a write it performs can trigger at
+  // most one more observer pass, which finds nothing to fix and settles —
+  // no feedback loop. It is (re)attached in ensureSettingsTab whenever the
+  // wiring refreshes (the game re-creates the container on re-renders) and
+  // disconnected in dropSettingsTab.
+  function watchStyleClobbers(container) {
+    if (styleClobberWatcher) {
+      try { styleClobberWatcher.disconnect(); } catch (e) {}
+      styleClobberWatcher = null;
+    }
+    if (!container || typeof MutationObserver !== "function") return;
+    styleClobberWatcher = new MutationObserver(() => {
+      if (!stlTabActive) return;
+      try {
+        reassertHiddenBuiltins();
+      } catch (e) {
+        // Never let a style-clobber reaction take the page down.
+      }
+    });
+    // subtree:true is REQUIRED: the clobbered nodes (Toolasha's panel, the
+    // built-in wrapper divs) are DESCENDANTS of the container, and attribute
+    // mutations on the container node alone never cover them — without the
+    // flag the observer only saw rewrites of the container's own style and
+    // a descendant clobber waited for the 400ms interval tick (verified
+    // live: +150ms sample still painted, fixed by the tick at +450ms).
+    styleClobberWatcher.observe(container, {
+      attributes: true,
+      attributeFilter: ["style"],
+      subtree: true,
+    });
+  }
+  function stopStyleClobberWatch() {
+    if (styleClobberWatcher) {
+      try { styleClobberWatcher.disconnect(); } catch (e) {}
+      styleClobberWatcher = null;
+    }
+  }
+
+  // v1.37.0: attach the tab-bar click handler to `document` ONCE. The previous
+  // design re-attached it to whatever `tabHost` node was current; when the
+  // game rebuilt that node in a long session, the listener was left stranded
+  // on a detached node (see onSettingsTabClick's note) and tab clicks stopped
+  // reaching us. `document` is never torn down by the game, so the handler
+  // stays live for the life of the page; it self-scopes each click via
+  // `closest`, so no per-host re-wiring is needed.
+  function installSettingsClickListener() {
+    if (settingsClickAttached) return;
+    settingsClickAttached = true;
+    document.addEventListener("click", onSettingsTabClick, true);
+  }
   // v1.36.0: set to the tab's settings-refresh closure once the duplicate
   // controls are wired, so setStlTabActive can re-paint them on (re)activation.
   // Module scope (not settingsWiring) so a re-render re-assigning
@@ -4542,6 +4910,19 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     if (ind && ind.style.display === "none") ind.style.display = "";
   }
 
+  // v1.37.0: hide a foreign (built-in / Toolasha) settings panel with
+  // `display:none !important`. A plain inline `display:none` provably loses
+  // in the cascade to Toolasha's own author stylesheet rule
+  // `#toolasha-settings { display:block !important }` (verified live in a
+  // real Edge window: inline none + computed block = the leaked panel).
+  // Inline !important beats author !important regardless of specificity, so
+  // this cannot be overridden while our tab is active. Deactivation restores
+  // the saved NON-important value, which drops our flag and hands visibility
+  // back to the game / Toolasha normally.
+  function hideForeignPanel(el) {
+    el.style.setProperty("display", "none", "important");
+  }
+
   // Set our tab + panel to the given active state. When activating, remember
   // each built-in panel's current hidden state so deactivation can restore it
   // exactly. (Our own panel is not a child of the built-in set.) On
@@ -4556,6 +4937,14 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     // Our own panel is driven by inline display (robust across deploys).
     const ourPanel = document.getElementById("stl-settings-tab-panel");
     if (ourPanel) ourPanel.style.display = active ? "block" : "none";
+    // The game can rebuild the Settings page while we're (un)active, leaving
+    // `settingsWiring` pointing at dead hosts — a hide/restore done against
+    // dead nodes is a silent no-op and the LIVE panels (Toolasha's included)
+    // show right under ours. Re-attach to the live container first
+    // (idempotent: re-parents our surviving nodes, refreshes listeners); its
+    // tail also re-asserts the hides while activating.
+    const liveContainer = findSettingsTabContainer();
+    if (liveContainer) ensureSettingsTab(liveContainer);
     if (!settingsWiring || !settingsWiring.panelsHost) return;
     const builtins = builtInPanels(settingsWiring.panelsHost);
     if (active) {
@@ -4572,13 +4961,21 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       builtins.forEach((el) => {
         if (builtInDisplayStyle.has(el)) return; // already hidden by us
         builtInDisplayStyle.set(el, el.style.display);
-        el.style.display = "none";
+        // v1.37.0: !important (Toolasha's block!important override — see
+        // hideForeignPanel). NOTE: the saved value above stays non-important,
+        // so deactivation-restore drops our flag.
+        hideForeignPanel(el);
       });
       // Re-paint the duplicated controls from stored config + detection so
       // they're never stale when (re)activated (e.g. after another window or
       // the popup changed a setting).
       if (stlTabRefresh) stlTabRefresh();
     } else {
+      // v1.37.0: our tab left the stage — stop the continuous guard, and the
+      // raw (non-!important) restores below hand Toolasha/built-in visibility
+      // back. (If we kept ticking while deactivated we'd re-hide panels that
+      // the player is now legitimately looking at.)
+      stopStlHideGuard();
       // Hand control back: restore the underline indicator and the built-in
       // panels' own visibility.
       unscrubBuiltInTabState();
@@ -4588,6 +4985,25 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         el.style.display = saved === "" ? "" : saved;
         builtInDisplayStyle.delete(el);
       });
+      // Toolasha's settings panel sits in the same panels host, but its tab
+      // switching (reviewed in its pinned v3.25.3 dist — setupTabSwitching in
+      // toolasha-ui.js) captured its tab/panel lists ONCE at injection and is
+      // purely click-driven: no observer re-asserts its panel. So if the
+      // player lands on a game tab whose button Toolasha never captured (a
+      // settings tab added by a game update), Toolasha's handler never runs
+      // and the restore above can leave its panel visible under the clicked
+      // one. When the clicked built-in tab is NOT Toolasha's own tab, pin its
+      // panel hidden — its own handler explicitly re-shows it when that tab
+      // is clicked, and in this build nothing else ever re-shows it, so the
+      // pin is stable. (When our tab is active, reassertHiddenBuiltins
+      // already keeps it hidden as any other built-in.)
+      const toolashaPanel = document.getElementById("toolasha-settings");
+      const clickedToolasha = !!(
+        clickedBuiltIn && clickedBuiltIn.id === "toolasha-settings-tab"
+      );
+      if (toolashaPanel && !clickedToolasha) {
+        toolashaPanel.style.display = "none";
+      }
       // Highlight the built-in tab the player actually clicked, immediately
       // (MUI's re-render confirms/positions it; doing it here mirrors
       // Toolasha/krymoore's manual switchTo so there's no flash of the stale
@@ -4598,6 +5014,47 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         clickedBuiltIn.setAttribute("tabindex", "0");
       }
     }
+    if (active) {
+      // Deterministic follow-up self-heals after activation. The click can
+      // land while the game is mid-rebuild of the Settings page (the rebuild
+      // churns the hosts our hide pass above just targeted, or re-parents
+      // our nodes, IN THE SAME BATCH — so the pass above can race it and
+      // leave the LIVE built-in/Toolasha panels visible under ours until the
+      // next arbitrary DOM mutation triggers the watcher). Two one-shot
+      // follow-ups — one right after this task's React flush, one after the
+      // slower async data-driven re-render — re-run the idempotent
+      // self-healing attach (re-sync wiring, re-hide builtins + Toolasha,
+      // re-show our panel, re-paint the title). Each is a no-op when
+      // everything is already correct (no mutation churn → no flicker, no
+      // observer loop); skipped if we were deactivated first or the page
+      // unmounted (dropSettingsTab clears stlTabActive).
+      const followUpHeal = () => {
+        if (!stlTabActive) return;
+        const c = findSettingsTabContainer();
+        if (c) ensureSettingsTab(c);
+      };
+      setTimeout(followUpHeal, 0);
+      setTimeout(followUpHeal, 400);
+      // v1.37.0: keep the hide CONTINUOUS while our tab is active, so a
+      // later game re-render (or a Toolasha panel re-injection) that clobbers
+      // our inline hides is corrected within one tick instead of waiting for
+      // the next arbitrary mutation (see startStlHideGuard's note).
+      startStlHideGuard();
+    }
+  }
+
+  // Rewrite the Settings page's title line to ours while our tab is active.
+  // The title is React-owned and only re-writes when the game's own tabIndex
+  // changes — which never happens for a foreign tab, so without this it stays
+  // on the last clicked tab's title (e.g. "Toolasha v3.25.3 Settings
+  // (refresh to apply)") under our panel and misreads. Toolasha does the same
+  // rewrite for its own tab. Only writes textContent (no childList churn →
+  // never trips our childList watcher), and is a no-op when already correct.
+  function paintSettingsTitle() {
+    const titleEl = document.querySelector('[class*="SettingsPanel_title"]');
+    if (titleEl && titleEl.textContent !== "MWI Trial Tracker") {
+      titleEl.textContent = "MWI Trial Tracker";
+    }
   }
 
   // Re-hide any built-in panel wrapper that is currently visible while our tab
@@ -4607,6 +5064,28 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   // time we hide it, so the value saved for deactivation-restore is never
   // clobbered by repeated re-asserts.
   function reassertHiddenBuiltins() {
+    // Self-heal first: if the game rebuilt the page (fresh container hosts)
+    // while our wiring pointed at the old ones, re-sync the wiring via
+    // ensureSettingsTab (re-parents our surviving nodes, refreshes listeners,
+    // and — while active — re-enters here once with fresh hosts).
+    const container = findSettingsTabContainer();
+    if (container) {
+      const tabHost =
+        container.querySelector('[class*="MuiTabs-flexContainer"]') || container;
+      const panelsHost = container.querySelector(
+        '[class*="TabsComponent_tabPanelsContainer"]'
+      );
+      if (!settingsWiring || !settingsWiring.panelsHost || panelsHost) {
+        const stale =
+          !settingsWiring ||
+          settingsWiring.tabHost !== tabHost ||
+          settingsWiring.panelsHost !== panelsHost;
+        if (stale) {
+          ensureSettingsTab(container);
+          if (!settingsWiring || !settingsWiring.panelsHost) return;
+        }
+      }
+    }
     if (!settingsWiring || !settingsWiring.panelsHost) return;
     // Prune wrappers a re-render detached (their saved entries are stale).
     for (const [node] of builtInDisplayStyle) {
@@ -4614,15 +5093,33 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     }
     builtInPanels(settingsWiring.panelsHost).forEach((el) => {
       if (!builtInDisplayStyle.has(el)) {
+        // Snapshot the raw (non-important) value before overriding: the
+        // saved value is what deactivation restores, and restoring it drops
+        // our !important flag (v1.37.0).
         builtInDisplayStyle.set(el, el.style.display);
-        el.style.display = "none";
+        hideForeignPanel(el);
       } else if (el.style.display !== "none") {
-        el.style.display = "none";
+        hideForeignPanel(el);
       }
     });
+    // Id-based safety net, immune to stale host enumeration: re-hide
+    // Toolasha's panel wherever it lives. (Normally it's covered by the
+    // wrapper loop above; this also covers the case where the wrapper loop
+    // ran against a dead host before the self-heal kicked in.) Saving it in
+    // the map here keeps deactivation-restore sane.
+    const toolashaPanel = document.getElementById("toolasha-settings");
+    if (toolashaPanel && toolashaPanel.isConnected) {
+      if (!builtInDisplayStyle.has(toolashaPanel)) {
+        builtInDisplayStyle.set(toolashaPanel, toolashaPanel.style.display);
+      }
+      if (toolashaPanel.style.display !== "none") {
+        hideForeignPanel(toolashaPanel);
+      }
+    }
     // A re-render can also re-apply Mui-selected to the stale built-in tab —
     // re-scrub so only our tab is highlighted while we're active.
     scrubBuiltInTabState();
+    paintSettingsTitle();
     const ourPanel = document.getElementById("stl-settings-tab-panel");
     if (ourPanel && ourPanel.style.display !== "block") {
       ourPanel.style.display = "block";
@@ -4670,13 +5167,32 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       // distinct #stlt- ids so they never collide with the panel's.
       stlPanel.innerHTML =
         '<div class="stl-tab-heading">MWI Trial Tracker</div>' +
+        // Mirrors the popup's Settings view order: Save, API base URL,
+        // character ID, character name, per-character enable switch, then the
+        // auto-sync / button / lock / reset controls.
+        '<div id="stlt-controls-top">' +
         '<div class="stlt-save"><button id="stlt-save" type="button">Save settings</button></div>' +
         '<label>API base URL</label>' +
         '<input id="stlt-apiBase" type="text" />' +
+        '</div>' +
+        // v1.36.0: character identity is auto-detected from the game and is
+        // read-only for reference. Kept OUTSIDE the hidden-when-off
+        // wrappers so the player can still see WHICH character is off.
         '<label>Character ID</label>' +
         '<input id="stlt-characterId" type="number" readonly />' +
         '<label>Character name</label>' +
         '<input id="stlt-characterName" type="text" readonly />' +
+        // v1.37.0: per-character master switch — ALWAYS visible, sitting
+        // right above the auto-sync toggle like the popup's copy. While this
+        // character is off, a note under the checkbox appears and the other
+        // controls (hidden together in #stlt-controls-top / #stlt-controls)
+        // stay hidden. The tab itself is never removed by the switch — it is
+        // the escape hatch that turns the tracker back on.
+        '<label class="stl-check" title="Turn the whole trial tracker on or off for THIS character only (keyed by its character ID — every other character in this browser keeps working as before).">' +
+        '<input id="stlt-enabled" type="checkbox" />' +
+        'Enable the trial tracker for this character</label>' +
+        '<div id="stlt-disabled-note"></div>' +
+        '<div id="stlt-controls">' +
         '<label class="stl-check" title="Automatically push this character\'s levels and profile to the ledger when the game opens and every 30 minutes (a 30-minute cooldown prevents reload spam)">' +
         '<input id="stlt-autosync" type="checkbox" />' +
         'Auto-sync this character (on open + every 30 min)</label>' +
@@ -4692,17 +5208,22 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         '<input id="stlt-panellock" type="checkbox" />' +
         'Lock panel position</label>' +
         '<div class="stlt-save"><button id="stlt-reset" type="button" title="Clears everything this app stored in this browser (settings, positions, saved levels, auto-sync state) and starts from a fresh-install state">Reset to default</button></div>' +
+        '</div>' +
         '<div id="stlt-status"></div>';
       panelsHost.appendChild(stlPanel);
     } else if (stlPanel.parentElement !== panelsHost) {
       panelsHost.appendChild(stlPanel);
     }
 
-    // (Re)wire click handlers. Our tab click activates us; any OTHER tab
-    // click deactivates us and hands control back to the built-in panels.
-    tabHost.removeEventListener("click", onSettingsTabClick, true);
+    // v1.37.0: the tab-bar click handler now lives ONCE on `document`
+    // (installed in startSettingsTabWatcher) so it can't be stranded when the
+    // game rebuilds `tabHost` — no per-host (re)wiring here. We still record
+    // the live hosts below so the hide/restore passes target the current DOM.
     settingsWiring = { container, tabHost, panelsHost, tab };
-    tabHost.addEventListener("click", onSettingsTabClick, true);
+    // v1.37.0 (follow-up): point the style-clobber observer at the current
+    // container (see watchStyleClobbers) so a re-render that rewrites a
+    // panel's inline style fixes in-task, before paint.
+    watchStyleClobbers(container);
 
     // ---- Wire the duplicated Settings controls (v1.36.0) ----
     // Each control writes the SAME stored config as the popup's copy, so the
@@ -4723,21 +5244,47 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       const tFabLock = stlPanel.querySelector("#stlt-fablock");
       const tPanelLock = stlPanel.querySelector("#stlt-panellock");
       const tAuto = stlPanel.querySelector("#stlt-autosync");
+      // v1.37.0: the per-character master switch's re-enable control.
+      const tEnabled = stlPanel.querySelector("#stlt-enabled");
 
       // Refresh the tab's settings inputs from stored config + detection.
-      // Mirrors the popup's syncSettingsUi (auto-sync is left alone, since
-      // the checkbox itself is its source of truth after first paint).
+      // Mirrors the popup's syncSettingsUi. Auto-sync is painted from the
+      // stored setting — the checkbox is built without a `checked`
+      // attribute, so without this paint it would stay unchecked (or
+      // stale) even while auto-sync is on in the panel/popup.
       const refreshTabSettingsUi = () => {
         const cfg = cfgGet();
         if (tApi) tApi.value = cfg.apiBase || "";
         tShowFab.checked = cfg.hideUpdateFab !== true; // default: shown
         tFabLock.checked = cfg.fabLocked !== false; // default: locked
         tPanelLock.checked = cfg.panelLocked !== false; // default: locked
+        tAuto.checked = cfg.autoSyncEnabled; // default: on
         const resolved = resolveCharacter();
         const idInput = stlPanel.querySelector("#stlt-characterId");
         const nameInput = stlPanel.querySelector("#stlt-characterName");
         if (idInput) idInput.value = resolved.characterId == null ? "" : resolved.characterId;
         if (nameInput) nameInput.value = resolved.characterName == null ? "" : resolved.characterName;
+        // v1.37.0: the per-character master switch — the checkbox is always
+        // visible (mirroring the popup's copy); while this character is off,
+        // show the off note and hide the other controls — both hidden groups
+        // (save/API above the identity fields, everything below) — while the
+        // character ID/name stay visible.
+        const disabled = trackerDisabled();
+        const controlsTop = stlPanel.querySelector("#stlt-controls-top");
+        const controls = stlPanel.querySelector("#stlt-controls");
+        const note = stlPanel.querySelector("#stlt-disabled-note");
+        if (controlsTop) controlsTop.hidden = disabled;
+        if (controls) controls.hidden = disabled;
+        if (tEnabled) tEnabled.checked = !disabled;
+        if (note) {
+          note.textContent = disabled
+            ? "The trial tracker is OFF for " +
+              (resolved.characterName
+                ? resolved.characterName + " (ID " + resolved.characterId + ")"
+                : "ID " + resolved.characterId) +
+              ". Nothing is tracked, pushed, or highlighted for this character until it is enabled."
+            : "";
+        }
       };
 
       stlPanel.querySelector("#stlt-save").addEventListener("click", () => {
@@ -4805,6 +5352,40 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         if (p) p.checked = event.target.checked;
       });
 
+      // v1.37.0: per-character master switch. It keys on the character ID
+      // the game reported for the logged-in character, so other characters
+      // in the same browser are unaffected. Enabling re-arms everything
+      // immediately (setCharacterDisabled → applyTrackerState → sweep +
+      // auto-sync + button) — no reload needed.
+      tEnabled.addEventListener("change", (event) => {
+        const { characterId, characterName } = resolveCharacter();
+        if (!Number.isInteger(characterId) || characterId <= 0) {
+          setTabStatus("No character ID detected yet — log in to the game first, then toggle this.", "err");
+          refreshTabSettingsUi();
+          return;
+        }
+        const enable = event.target.checked;
+        // v1.37.0: confirm before flipping the master switch — off carries a
+        // warning (it strips everything the tracker does in this page).
+        const who = characterName ? `${characterName} (ID ${characterId})` : `ID ${characterId}`;
+        const message = enable
+          ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's optimizer pick.`
+          : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the optimizer-pick / sit-out highlight and update button all go away. You can turn it back on anytime from this tab.`;
+        if (!window.confirm(message)) {
+          tEnabled.checked = !enable; // cancel: put the switch back
+          return;
+        }
+        setCharacterDisabled(characterId, !enable);
+        setTabStatus(
+          enable
+            ? "Trial tracker enabled for this character — button, auto-sync, and the trial highlight are back on."
+            : "Trial tracker switched off for this character. It does nothing until you enable it again from this tab.",
+          "ok"
+        );
+        const p = document.getElementById("stl-settings-enabled"); // keep the popup in sync
+        if (p) p.checked = enable;
+      });
+
       stlPanel.querySelector("#stlt-reset").addEventListener("click", () => {
         if (!window.confirm(
           "Reset to default?\n\nThis clears everything the Trial Tracker stored in this browser (API base, character ID/name, button/panel positions, saved levels, auto-sync state) — like a fresh install. Your ledger data on the website is NOT touched."
@@ -4815,21 +5396,16 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         const nameInput = stlPanel.querySelector("#stlt-characterName");
         if (idInput) idInput.value = resolved.characterId == null ? "" : resolved.characterId;
         if (nameInput) nameInput.value = resolved.characterName == null ? "" : resolved.characterName;
+        // v1.37.0: the reset may have cleared THIS character's off state —
+        // repaint so the tab shows the correct (enabled) controls.
+        refreshTabSettingsUi();
         setTabStatus(`Reset to default \u2014 cleared ${count} stored values. Fresh-install state.`, "ok");
       });
 
-      // Paint the stored values into the (freshly built) tab inputs.
-      const cfg = cfgGet();
-      if (tApi) tApi.value = cfg.apiBase || "";
-      tShowFab.checked = cfg.hideUpdateFab !== true;
-      tFabLock.checked = cfg.fabLocked !== false;
-      tPanelLock.checked = cfg.panelLocked !== false;
-      tAuto.checked = cfg.autoSyncEnabled !== false; // default: on
-      const tResolved = resolveCharacter();
-      const tId = stlPanel.querySelector("#stlt-characterId");
-      const tName = stlPanel.querySelector("#stlt-characterName");
-      if (tId) tId.value = tResolved.characterId == null ? "" : tResolved.characterId;
-      if (tName) tName.value = tResolved.characterName == null ? "" : tResolved.characterName;
+      // Paint the stored values — and the per-character switch state
+      // (v1.37.0) — into the freshly built tab inputs with the same paint
+      // the (re)activations use.
+      refreshTabSettingsUi();
 
       // Expose the tab's re-paint so the popup's view-switch can refresh it
       // (keeps the two duplicates in sync regardless of which is edited).
@@ -4847,27 +5423,54 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
 
   // Click handler on the whole tab bar (capture phase): our tab → activate;
   // a built-in tab → deactivate and re-highlight it.
+  // v1.37.0: the ONE permanent listener lives on `document` (see
+  // installSettingsClickListener). It used to be attached to the
+  // `tabHost` node captured at (re)wiring time — but the game REBUILDS that
+  // node on re-renders, so in long sessions the listener silently survived
+  // on a DETACHED node: tab clicks stopped reaching us, our `stlTabActive`
+  // state desynced from the DOM, and foreign panels were left stacked under
+  // the wrong tab (observed live: clicking Toolasha's tab did nothing, our
+  // tab stayed "active" with a stale title until an unrelated click).
+  // Resolving the container from the LIVE click target via `closest` (instead
+  // of a global `querySelector`) is both staleness-proof (it climbs from the
+  // exact node that was just clicked, which is always in the current tree) and
+  // cheap (it stops as soon as it leaves the subtree, so clicks elsewhere on
+  // the page bail out without scanning the DOM).
+  //
+  // CAREFUL SCOPING (fixes a live-reported regression): the container
+  // selector matches the whole Settings page INCLUDING the panel area, so
+  // "a click that is not on our tab" is NOT "a click on another tab".
+  // Deactivation may only happen when the player actually clicked a built-in
+  // TAB BUTTON — the game's own tab switching is likewise button-driven.
+  // Clicks anywhere else in the page (labels, inputs and buttons INSIDE our
+  // tab's content, the tab strip background) must be inert for us: the
+  // player is interacting with our tab, not choosing another one.
   function onSettingsTabClick(event) {
+    const target = event.target;
+    if (!target || !target.closest) return;
+    const container = target.closest('[class*="SettingsPanel_tabsComponentContainer"]');
+    if (!container) return; // click elsewhere on the page
     const tab = document.getElementById("stl-settings-tab");
-    if (tab && tab.contains(event.target)) {
+    if (tab && tab.contains(target)) {
       setStlTabActive(true);
-    } else {
-      // Identify the built-in tab the player clicked so we can re-highlight it.
-      const btn = event.target && event.target.closest ? event.target.closest('button[role="tab"]') : null;
-      const builtIn =
-        btn &&
-        !btn.hasAttribute(STL_SETTINGS_TAB_MARKER) &&
-        btn !== document.getElementById("stl-settings-tab");
-      setStlTabActive(false, false, builtIn || null);
+      return;
     }
+    // Only a built-in tab button counts as "leaving our tab" — and it must be
+    // a button, not just our own tab button (handled above) or a click that
+    // happened to resolve to one through a child element.
+    const btn = target.closest("button[role=\"tab\"]");
+    if (!btn || btn === tab) return;
+    if (btn.hasAttribute(STL_SETTINGS_TAB_MARKER)) return;
+    setStlTabActive(false, false, btn);
   }
 
   function dropSettingsTab() {
-    if (settingsWiring && settingsWiring.tabHost) {
-      settingsWiring.tabHost.removeEventListener("click", onSettingsTabClick, true);
-    }
     // The whole Settings page is unmounted, so the built-in wrappers we may
     // have hidden are gone with it — no need to restore them individually.
+    // v1.37.0: the page is gone, so the continuous guard + the style-clobber
+    // observer lose their purpose.
+    stopStlHideGuard();
+    stopStyleClobberWatch();
     builtInDisplayStyle.clear();
     stlTabActive = false;
     settingsWiring = null;
@@ -4876,9 +5479,13 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   // Watch the whole document for the Settings tab bar so the tab survives the
   // game's SPA navigation (open / close / re-render of the Settings page).
   function startSettingsTabWatcher() {
+    // v1.37.0: also (once) install the permanent document-level tab-click
+    // handler — it never goes stale, unlike a per-tab-host listener.
+    installSettingsClickListener();
     if (settingsTabWatcher || typeof MutationObserver !== "function" || !document.body) return;
     settingsTabWatcher = new MutationObserver(() => {
-      if (!findSettingsTabContainer()) {
+      const container = findSettingsTabContainer();
+      if (!container) {
         // The Settings page left the DOM — release our wiring so a later
         // re-open starts clean. (Injected nodes are gone with the page.)
         dropSettingsTab();
@@ -4886,25 +5493,108 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       }
       // The in-game Settings tab is always on — there is no setting to turn
       // it off, so a user can never lock themselves out of the controls.
-      // Steady state: both our tab AND our panel are attached. A re-render
-      // may have just re-created the built-in panel wrappers (as visible)
-      // underneath an active tab — re-hide them so they don't stack under
-      // ours. (Also re-asserts our panel's display if a re-render reset it.)
-      if (
-        document.getElementById("stl-settings-tab") &&
-        document.getElementById("stl-settings-tab-panel")
-      ) {
+      // Steady state: our tab + panel are BOTH children of the LIVE hosts.
+      // (Checked by parent, not mere existence: the game can rebuild the
+      // page so our surviving nodes sit in dead hosts — or in the live
+      // hosts without our wiring knowing, and only a parent check separates
+      // "wired and fine" from "stale wiring, panels stacking under us".)
+      const liveTabHost =
+        container.querySelector('[class*="MuiTabs-flexContainer"]') || container;
+      const livePanelsHost = container.querySelector(
+        '[class*="TabsComponent_tabPanelsContainer"]'
+      );
+      const tab = document.getElementById("stl-settings-tab");
+      const panel = document.getElementById("stl-settings-tab-panel");
+      const tabLive = !!(tab && tab.isConnected && tab.parentElement === liveTabHost);
+      const panelLive =
+        !!(livePanelsHost && panel && panel.isConnected && panel.parentElement === livePanelsHost);
+      if (tabLive && panelLive) {
+        // A re-render may have just re-created the built-in panel wrappers
+        // (as visible) underneath an active tab — re-hide them so they don't
+        // stack under ours. (Also re-asserts our panel's display if a
+        // re-render reset it, and self-heals stale wiring + our nodes.)
         if (stlTabActive) reassertHiddenBuiltins();
         return;
       }
-      // Defer one tick so the game's own render has finished laying out the
-      // tab bar before we append (keeps our tab at the end, stable).
+      // Our nodes are missing or stranded outside the live hosts — (re)attach
+      // them. Defer one tick so the game's own render has finished laying out
+      // the tab bar before we append (keeps our tab at the end, stable).
       setTimeout(() => {
-        const container = findSettingsTabContainer();
-        if (container) ensureSettingsTab(container);
+        const c = findSettingsTabContainer();
+        if (c) ensureSettingsTab(c);
       }, 0);
     });
     settingsTabWatcher.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ---------------------------------------------------------------------
+  // v1.37.0 — Per-character master switch applier.
+  //
+  // Runs whenever the logged-in identity resolves or changes (the game's
+  // init_character_data on login and on in-page character switches — see
+  // handleGameMessage) or the switch itself flips (Settings tab / panel
+  // toggles, via setCharacterDisabled). A disabled character strips
+  // everything the tracker put in the page: the floating button, any open
+  // panel / guild overlay, the trial highlight + notice (and the retry
+  // chain + panel observer that would repaint them), and the update
+  // banner / FAB dot. An enabled character re-arms the same things
+  // immediately — button back, plan refetched, highlight re-applied,
+  // auto-sync re-armed, update nag refetched — no reload needed.
+  //
+  // The in-game Settings tab is never stripped: it is the escape hatch
+  // that turns a disabled character back on, so it is re-painted instead
+  // (stlTabRefresh).
+  //
+  // Idempotent per (character, state) pair: the game re-sends init data,
+  // so the body below runs once per actual change rather than per message.
+  // ---------------------------------------------------------------------
+  let trackerStateKey = null;
+
+  function applyTrackerState() {
+    const characterId = resolveCharacter().characterId;
+    const disabled = isCharacterDisabled(characterId);
+    const key = (characterId == null ? "unknown" : characterId) + ":" + disabled;
+    if (trackerStateKey === key) return;
+    trackerStateKey = key;
+
+    if (disabled) {
+      removeFab();
+      // Close any tracker UI that is on screen (both become unreachable
+      // once the button is gone, but left open they'd look "on").
+      if (panel && panel.classList.contains("open")) panel.classList.remove("open");
+      if (overlayEl && overlayEl.classList) overlayEl.classList.remove("stl-overlay-open");
+      // Wipe every mark the tracker painted in the game world (highlight
+      // card + badge, "no suitable trial" / "ledger unreachable" notice).
+      clearTrialHighlightMarks();
+      appliedHighlight = null;
+      appliedNoTrialNotice = null;
+      const notice = document.getElementById("stl-trial-notice");
+      if (notice) notice.remove();
+      // Freeze the highlight retry chain and detach the trials-panel
+      // observer so a late re-render can't repaint anything.
+      if (highlightRetryTimer !== null) {
+        clearTimeout(highlightRetryTimer);
+        highlightRetryTimer = null;
+      }
+      highlightRetryCount = 0;
+      highlightRetryPanel = null;
+      observeTrialPanel(null);
+    } else if (document.body) {
+      if (!cfgGet().hideUpdateFab) ensureFab();
+      sweep(); // refetch the plan, re-apply the highlight, re-observe
+      checkForUpdate(cfgGet().apiBase.replace(/\/$/, "")); // re-arm the nag
+    }
+    // The banner + FAB dot hide themselves while disabled (render reads
+    // the switch on every paint); both directions repaint so a switch-off
+    // hides a banner the startup fetch already showed.
+    renderUpdateReminder();
+    // Keep the in-game Settings tab's controls honest — it is the only UI
+    // that survives a switch-off, so it must show the new state.
+    if (stlTabRefresh) {
+      try {
+        stlTabRefresh();
+      } catch (e) { /* tab not mounted */ }
+    }
   }
 
   function init() {
@@ -4931,11 +5621,18 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         checkForUpdate(cfgGet().apiBase.replace(/\/$/, ""));
       }
     };
-    if (!cfgGet().hideUpdateFab) ensureFab();
+    // v1.37.0: a character already known to be off (last session's
+    // detection, or an init message before the DOM was ready) never
+    // flashes the button / update nag — the in-game Settings tab remains
+    // the one tracker UI on the page.
+    if (!cfgGet().hideUpdateFab && !trackerDisabled()) ensureFab();
 
-    // v1.37.0: fetch the ledger's latest version at startup. The banner is
-    // idempotent, so this is safe even before the panel exists.
-    checkForUpdate(cfgGet().apiBase.replace(/\/$/, ""));
+    // v1.37.0: fetch the ledger's latest version at startup (skipped while
+    // this character is off — applyTrackerState re-fetches on re-enable).
+    // The banner is idempotent, so this is safe even before the panel exists.
+    if (!trackerDisabled()) {
+      checkForUpdate(cfgGet().apiBase.replace(/\/$/, ""));
+    }
 
     // v1.36.0: watch for the in-game Settings page so the "Trial Tracker"
     // tab attaches the moment the page mounts (and re-attaches after
@@ -4960,6 +5657,16 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   // auto-sync, fab lock, and reset all live in the in-panel Settings view,
   // and level editing / advanced fields were removed entirely.
   GM_registerMenuCommand("MWI Trial Tracker: hide/show Trial Tracker button", () => {
+    // v1.37.0: while this character is switched off the button can't be
+    // shown — point the player at the escape hatch that can turn the
+    // tracker back on (the in-game Settings tab is the only UI the
+    // switch keeps alive).
+    if (trackerDisabled()) {
+      window.alert(
+        "The trial tracker is switched OFF for this character. Turn it back on from the in-game Settings \u2192 Trial Tracker tab."
+      );
+      return;
+    }
     const hide = !cfgGet().hideUpdateFab;
     cfgSet({ hideUpdateFab: hide });
     if (hide) {
