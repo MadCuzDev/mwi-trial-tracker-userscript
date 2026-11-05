@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MWI Trial Tracker
 // @namespace    http://tampermonkey.net/
-// @version      1.36.3
+// @version      1.37.0
 // @description  Tracks and optimizes trials  on milkywayidle.
 // @author       MadCuzDev, Rhohydronian
 // @match        https://www.milkywayidle.com/*
@@ -159,7 +159,7 @@
   // the @version metadata above — bump BOTH on every release (even tiny ones;
   // the third digit is for super-small changes), or the member list will show
   // the wrong "latest" comparison.
-  const SCRIPT_VERSION = "1.36.3";
+  const SCRIPT_VERSION = "1.37.0";
 
   // All 17 MWI skills: the 10 skilling skills plus the 7 combat stats.
   // `icon` is rendered next to each skill in the roster overlay header and
@@ -489,6 +489,11 @@
   let updateLatest = null;
   let updateFetchInFlight = false;
 
+  // Where a newer build lives: this script's Greasy Fork page. The in-game
+  // "update available" banner links to it.
+  const GREASYFORK_PAGE =
+    "https://greasyfork.org/en/scripts/596862-mwi-trial-tracker";
+
   // v1.29.0: trial highlight + panel observation state. Declared here
   // (near the other plan state, well above the startup block) instead of
   // next to the functions that use it: on a late page load the startup
@@ -591,13 +596,138 @@
   let pullState = { running: false, paused: false, fetched: 0, total: 0, aborted: false };
   let overlayEl = null;
   let overlayBuilt = false;
-  let overlayState = { minimized: false };
+  // v1.37.x: quiet background-run tracking. While the roster panel is tucked
+  // into its floating pill, the pill mirrors progress for any running
+  // action; `loadoutsAck` keeps the pill up with the burst's completion
+  // summary until the user restores the panel.
+  let overlayState = {
+    minimized: false,
+    loadouts: { running: false, done: 0, total: 0, captured: 0 },
+    loadoutsAck: false
+  };
+
+  // ---------------------------------------------------------------------
+  // Weekly trial snapshot capture (feeds the Trial History page).
+  //
+  // The game broadcasts, over the same WS we already hook, everything a
+  // guild-wide weekly snapshot needs — zero manual steps for members:
+  //   - guild_trial_stats_updated: guild-wide per-member-per-trial stat
+  //     rows { characterId, trialHrid, damageDealt, healingDone,
+  //     premitigatedDamageTaken, workDone } (combat rows carry
+  //     damage/healing/damage-taken, skilling rows carry workDone). The
+  //     game clears this list on a week rollover; a fresh answer is
+  //     available on demand via { type: "get_guild_trial_stats" } (the
+  //     same request the in-game Stats dialog sends), which this capture
+  //     fires right before pushing so even a member who was offline
+  //     during the trials records the server's current guild-wide list.
+  //   - guild_trial_signup_updated (+ the guildCharacterMap entries of
+  //     guild_characters_updated): per member, which trial and which
+  //     LOADOUT they signed up with — signedUp{Skilling,Combat}
+  //     TrialHrid / LoadoutID / RoleHrid fields, stamped with
+  //     signupWeekStartAt so stale old-week updates can't leak in.
+  //   - guild.currentWeekStartAt: anchor of the current guild week — the
+  //     week starts at the Friday 00:00 UTC guild-trial reset (ISO-8601
+  //     string in current builds; older ones sent an ms epoch); the
+  //     snapshot week key is the UTC DATE of that anchor ("YYYY-MM-DD"),
+  //     which the server accepts and which is stable for each game week.
+  //   - guild.currentTrialsData: this week's {skilling,combat} trial
+  //     statuses ("scheduled" | "in_progress" | "completed").
+  //
+  // Push targets (server upserts, so overlapping pushes are harmless —
+  // a later one just refreshes the rows):
+  //   1. rollover  — the instant a NEW week's guild message arrives, the
+  //      just-ended week's captured buffer goes up under its OWN weekKey
+  //      (the game clears its stat list in that same message, so this is
+  //      the last chance for the old data);
+  //   2. completed — once both of this week's trials report "completed",
+  //      the final state lands within minutes of the last trial;
+  //   3. manual    — the panel's "Push Snapshot" button: a direct
+  //      guild-gated push from this in-game client, exactly like the
+  //      guild roster's "Push to ledger" (any member of the guild can
+  //      send it; the server enforces membership — the site's old
+  //      "Snapshot now" request round-trip is gone).
+  // ---------------------------------------------------------------------
+  const SNAPSHOT_PUSH_COOLDOWN_MS = 3 * 60 * 1000; // rate-limits auto re-pushes
+  const SNAPSHOT_STATS_REFRESH_MS = 2500; // wait for the get_guild_trial_stats answer
+  let trialsSnapshot = {
+    weekStartAt: null, // guild.currentWeekStartAt of the week being captured
+    weekKey: null, // UTC date ("YYYY-MM-DD") the game's week starts (Friday 00:00 UTC reset)
+    statuses: { skilling: null, combat: null }, // parsed currentTrialsData
+    statRows: [], // latest guild-wide guildTrialStatList for this week
+    statListUpdatedAt: 0, // when statRows last changed (refresh detection)
+    signups: {}, // charId -> { name, skilling/combat: {trialHrid, loadoutId, roleHrid} }
+    lastPushedWeekKey: null, // local anti-duplicate guard per week
+    lastPushAt: 0,
+    lastPushRichness: 0, // captured-data count at the last successful push
+    pushInFlight: false,
+    itemNameMap: null, // lazy hrid -> item detail, for loadout name resolution
+    trialLoadouts: {}, // "charId:kind" -> normalized signed-up trial loadout
+    pendingViewLoadouts: [], // in-flight view_loadout requests (FIFO + name match)
+    // Per-trial tile values from the game's currentTrialsData: trialHrid
+    // (full, e.g. "/guild_skilling/alchemy") -> { kind, points, tier
+    // (1-based index, 0 = none), progress (0..1 next-tier), done,
+    // capturedAt }. Rides along with every snapshot push so the History
+    // tables can mirror the in-game Guild -> Trials tile at their top.
+    trialProgress: {},
+    lastPushTrialStats: "" // serialized wire form at the last successful push
+  };
 
   const PROFILE_FETCH = {
     delayMs: 1000, // gap between member requests
     timeoutMs: 5000, // wait this long for a single member's profile_shared
     maxRetries: 2 // re-send the view_profile request on timeout
   };
+
+  // Trial-loadout fetch (feeds the History page's "loadout they used"
+  // menu): the game answers { type: "view_loadout", viewLoadoutData:
+  // { characterId, context: "guild_trial", kind } } with a
+  // "loadout_shared" frame (verified in-game: ~150 ms, works for ANY
+  // signed-up member, online or offline). Both context AND kind are
+  // required — the server silently drops a kind-less request
+  // (kind: undefined is stripped from the wire by JSON.stringify).
+  const TRIAL_LOADOUT_FETCH = {
+    timeoutMs: 8000, // wait this long for one member's loadout_shared
+    gapMs: 1000, // one request per second — the burst paces the game gently
+    maxTargets: 260 // safety cap per burst (guild size x 2 kinds)
+  };
+  let loadoutBurstRunning = false;
+
+  // While a loadout burst runs, the game's own socket dispatcher opens the
+  // "X's Loadout" popup for EVERY loadout_shared frame it sees (root
+  // state `sharableLoadout` — the popup in the Combat zone screen). The
+  // burst's one-request-per-second answers would keep that modal parked
+  // on top of the user's game view for the whole run. The MessageEvent.
+  // data getter hook (patchPageWebSocket below) hands the game a NEUTRAL
+  // frame ({ type, loadout: null } — the game closes/keeps-closed its
+  // popup on that) for exactly the frames that answer OUR pending
+  // view_loadout requests, while the RAW frame still feeds our capture.
+  // Nameless or unmatched frames pass through untouched, so a member the
+  // user opens in-game during the burst still pops normally.
+  function neuterLoadoutFrameForGame(rawMessage) {
+    if (!loadoutBurstRunning) return null;
+    const q = trialsSnapshot.pendingViewLoadouts;
+    if (!q.length) return null;
+    if (typeof rawMessage !== "string" || rawMessage.indexOf("loadout_shared") < 0) {
+      return null; // fast path: most game frames are not loadout answers
+    }
+    let frame = null;
+    try { frame = JSON.parse(rawMessage); } catch (e) { return null; }
+    if (!frame || frame.type !== "loadout_shared") return null;
+    const lo = frame.loadout && typeof frame.loadout === "object" ? frame.loadout : null;
+    if (!lo) return null;
+    const sc = lo.sharableCharacter || {};
+    const who = (typeof sc.name === "string" && sc.name) ? sc.name.toLowerCase() : null;
+    if (!who) return null; // nameless echoes never match our named pending queue
+    // Only answers to OUR pending requests (same match rule as
+    // handleSharedLoadoutResponse) — never a loadout the user opened.
+    const ours = q.some((r) => r.name && r.name.toLowerCase() === who);
+    if (!ours) return null;
+    try {
+      return JSON.stringify({ type: "loadout_shared", loadout: null });
+    } catch (e) {
+      return null;
+    }
+  }
 
   function isGameSocket(socket) {
     try {
@@ -673,6 +803,10 @@
         // v1.26.0: game (re)open — auto-sync if enabled and due (cooldown
         // dedupes the init re-send on character switch / reload).
         maybeAutoSync();
+        // Weekly-snapshot state (week anchor, trial statuses, this
+        // week's completion) also rides on the login payload's guild
+        // object.
+        trackGuildTrialWeek(data);
         break;
       case "skills_updated":
         ingestSkills(data.characterSkills);
@@ -680,17 +814,34 @@
       case "action_completed":
         ingestSkills(data.endCharacterSkills);
         break;
+      case "guild_trial_stats_updated":
+        // Guild-wide per-member-per-trial stats (the Trial History
+        // capture stores these rows; see the module above).
+        captureSnapshotStats(data);
+        break;
+      case "guild_trial_signup_updated":
+        // Per-member trial + loadout signup (which loadout each member
+        // used for the week's trials).
+        captureSnapshotSignup(data);
+        break;
       case "guild_characters_updated":
         handleGuildCharactersUpdated(data);
         captureCombatTrials(data);
         captureSkillingTrials(data);
+        trackGuildTrialWeek(data);
         break;
       case "guild_updated":
         captureCombatTrials(data);
         captureSkillingTrials(data);
+        trackGuildTrialWeek(data);
         break;
       case "profile_shared":
         ingestProfileResponse(data);
+        break;
+      case "loadout_shared":
+        // Answer to one of our view_loadout requests — the member's
+        // signed-up trial loadout (see the fetch block below).
+        handleSharedLoadoutResponse(data);
         break;
       case "init_client_data":
         // The static guild-trial table (per-trial sortIndex/kind) rides in
@@ -720,6 +871,17 @@
         if (members.length > 0) {
           ingestGuildRoster(members, guild.name || guild.guildName || null);
         }
+        // v1.37.0: the current game build carries the roster maps at the
+        // message TOP level (guildCharacterMap / guildSharableCharacterMap
+        // beside `guild` — verified from a live init_character_data dump:
+        // the nested guild object contains neither), so the pass above can
+        // find nobody. Run the panel-message handler on the same payload:
+        // it reads the top-level maps, and its union merge makes the
+        // double-capture harmless.
+        handleGuildCharactersUpdated({
+          ...data,
+          guildName: data.guildName || (guild.name || guild.guildName || null)
+        });
       }
     }
   }
@@ -826,8 +988,10 @@
   //       { guildCharacterMap: { [charId]: { role, joinTime, ... } },
   //         guildSharableCharacterMap: { [charId]: { name, isOnline } } }
   //     Fired when the Guild panel is opened.
-  //   - init_character_data: the guild object (and its members) is embedded
-  //     here at login, so we capture the roster without requiring the user
+  //   - init_character_data: the guild object is embedded here at login
+  //     (current build: the roster maps ride at the message top level,
+  //     beside `guild` — the handler call in that branch covers both
+  //     placements), so we capture the roster without requiring the user
   //     to open the panel.
   //   - profile_shared: one member's full profile, in response to our
   //     view_profile request. Carries characterSkills: [{skillHrid, level}].
@@ -976,7 +1140,12 @@
     full.skills = skills;
     pulledProfilesFull[key] = full;
     pullState.fetched = Object.keys(pulledProfiles).length;
-    if (overlayEl && overlayEl.classList.contains("stl-overlay-open")) renderOverlay();
+    if (overlayEl && overlayEl.classList.contains("stl-overlay-open")) {
+      renderOverlay();
+      // v1.37.0: a gear hover on this member may be open ("fetching…") —
+      // upgrade it to the real gear now that the profile arrived.
+      if (gearTipCid !== null) refreshGearTip();
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1075,10 +1244,14 @@
   }
 
   // Extract a member's loadouts from a profile payload.
-  // `characterLoadoutMap` is the real in-game field (an id-keyed object,
-  // present in both init_character_data and profile_shared.profile); the
-  // map key is the loadout id, so it's passed as the id fallback. The
-  // *Dict variant is how the game renames *Map fields in its React state.
+  // Two real placements exist (verified from live payloads in
+  // profileshape-*.json):
+  //  - OUR OWN init_character_data carries `characterLoadoutMap` (id-keyed
+  //    loadout objects with a wearableMap of "id::loc::item::E" strings).
+  //  - OTHER members' profile_shared.profile carries NO loadout map at all —
+  //    just `wearableItemMap` (locationHrid -> {itemHrid, enhancementLevel,
+  //    ...}), the currently-equipped set, plus a `hideWearableItems` flag.
+  // *Dict variants are how the game renames *Map fields in its React state.
   function extractLoadouts(raw) {
     if (!raw || typeof raw !== "object") return [];
     const candidates = [
@@ -1099,6 +1272,31 @@
             .map(([key, value]) => normalizeLoadout(value, key))
             .filter(Boolean);
         }
+      }
+    }
+    // Fallback: other members' profile_shared has `wearableItemMap`
+    // (location -> equipped-item object with itemHrid/enhancementLevel but
+    // no loadout structure). Synthesize one "Currently equipped" loadout so
+    // the roster tooltip can still show their gear.
+    const wim = raw.wearableItemMap;
+    if (wim && typeof wim === "object" && !Array.isArray(wim)) {
+      const equipment = [];
+      for (const [slot, value] of Object.entries(wim)) {
+        if (!value || typeof value !== "object" || !value.itemHrid) continue;
+        equipment.push({
+          slot,
+          itemHrid: String(value.itemHrid),
+          enhancementLevel: Number(value.enhancementLevel) || 0
+        });
+      }
+      if (equipment.length > 0) {
+        return [{
+          loadoutId: null,
+          name: "Currently equipped",
+          actionTypeHrid: null,
+          isDefault: true,
+          equipment
+        }];
       }
     }
     return [];
@@ -1224,12 +1422,31 @@
         if (socket && isGameSocket(socket)) {
           attachSocketMessageListener(socket); // keep constructor-path sockets working
           try {
+            // `__stlFrameChecked` guards the re-entrant reads: processSocketMessage
+            // (or our constructor listener) reads event.data from INSIDE this getter.
+            if (!this.__stlFrameChecked) {
+              this.__stlFrameChecked = true;
+              const neutered = neuterLoadoutFrameForGame(message);
+              if (neutered) {
+                // Burst is running and this answer is ours: capture the RAW
+                // frame, then hand the game a neutral one so its "X's Loadout"
+                // popup never opens (pull-members parity: no game UI while the
+                // background fetch is in flight). Every later read of this
+                // event — the game's dispatcher included — gets the neutral
+                // frame, so the popup stays closed from first to last.
+                this.__stlNeutered = neutered;
+                processedMessageEvents.add(this); // skip processSocketMessage
+                queueRawMessage(message);
+                return neutered;
+              }
+            }
             processSocketMessage(this, socket);
           } catch (e) {
-            // Never break the game's message reading.
+            // Never break the game's message reading — fail open (raw frame).
+            this.__stlNeutered = null;
           }
         }
-        return message;
+        return this.__stlNeutered || message;
       };
       Object.defineProperty(pageMessageEvent.prototype, "data", dataProperty);
       return true;
@@ -1552,6 +1769,12 @@
     refreshPanelTrialOrder();
     // v1.26.0: periodic auto-sync gate — cheap no-op unless due.
     maybeAutoSync();
+    // Weekly trial snapshot (Trial History page): push when due — both of
+    // this week's trials completed. Rollover captures fire immediately in
+    // trackGuildTrialWeek, not here. The manual trigger is the panel's
+    // "Push Snapshot" button (direct guild-gated push, like the roster
+    // push — there is no longer a site-side request round-trip).
+    maybeCompletionSnapshot();
   }
 
   if (document.readyState === "loading") {
@@ -1583,8 +1806,22 @@
     planFetchInFlight = true;
     planFetchStartedAt = Date.now();
     try {
-      const res = await gmRequest("GET", `${apiBase}/api/trials/plans/latest`);
+      const plansUrl = `${apiBase}/api/trials/plans/latest`;
+      let res = await gmRequest("GET", plansUrl);
       planFetchAttempted = true;
+      if (res.status === 304) {
+        // HTTP-cache revalidation: the browser/Tampermonkey answered from
+        // a cached ETag, so the body is EMPTY. If we already hold a plan
+        // this is a no-op win. On the very first fetch of a page load we
+        // still have no body, so retry once against a cache-busted URL
+        // (the server also marks this route no-store, but older servers
+        // may still revalidate).
+        if (latestPlan !== null) {
+          planState = "ready";
+          return;
+        }
+        res = await gmRequest("GET", `${plansUrl}?nc=${Date.now()}`);
+      }
       if (res.status === 404) {
         latestPlan = null;
         planState = "none";
@@ -1668,8 +1905,20 @@
       dismissed !== updateLatest;
     if (banner) {
       if (outdated) {
-        banner.querySelector(".stl-update-msg").textContent =
-          `Update available — v${updateLatest} is out (you're on v${SCRIPT_VERSION}). Update the script to get the latest features.`;
+        // Built from DOM nodes (not innerHTML) so the version strings from
+        // the ledger can never inject markup; the Greasy Fork link is the
+        // clickable part of the message.
+        const msg = banner.querySelector(".stl-update-msg");
+        msg.textContent =
+          `Update available — v${updateLatest} is out (you're on v${SCRIPT_VERSION}). `;
+        const link = document.createElement("a");
+        link.className = "stl-update-link";
+        link.textContent = "greasyfork.org";
+        link.href = GREASYFORK_PAGE;
+        link.target = "_blank";
+        link.rel = "noopener";
+        msg.appendChild(link);
+        msg.append(" to get the latest features.");
         banner.hidden = false;
       } else {
         banner.hidden = true;
@@ -2031,8 +2280,8 @@
     badge.className = "stl-trial-badge";
     badge.textContent =
       Number.isFinite(pts) && pts > 0
-        ? "\u2605 Optimizer pick \u00b7 " + pts + " pts"
-        : "\u2605 Optimizer pick";
+        ? "\u2605 Recommended Trial \u00b7 " + pts + " pts"
+        : "\u2605 Recommended Trial";
     card.appendChild(badge);
     appliedHighlight = { label: bestSkill.label, pts: pts, card: card };
     return true;
@@ -2668,39 +2917,157 @@
 
   // ---------------------------------------------------------------------
   // v1.6.0 — full trial profile + client data push (Weekly Skilling Trial)
+  // v1.37.0 — also captures/pushes combat-trial boss stats (trial monster
+  //            combatDetails + the static guild-trial table) so the combat
+  //            simulator on the ledger can run against live game data.
   // ---------------------------------------------------------------------
 
-  // The game exposes its static client data (item details, etc.) through a
-  // page-level `localStorageUtil` global. We run sandboxed, so reach it via
-  // unsafeWindow. Returns the itemDetailMap or null when unavailable.
-  function readItemDetailMap() {
+  // The game exposes its static client data (item details, monster details,
+  // etc.) through a page-level `localStorageUtil` global. We run sandboxed,
+  // so reach it via unsafeWindow. Returns
+  // { itemDetailMap: object|null, combatTrialData: object|null }.
+  function readClientData() {
+    const result = { itemDetailMap: null, combatTrialData: null };
     try {
       const pageWindow = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
       const util = pageWindow.localStorageUtil;
       if (util && typeof util.getInitClientData === "function") {
         const clientData = util.getInitClientData();
         if (clientData && typeof clientData.itemDetailMap === "object") {
-          return clientData.itemDetailMap;
+          result.itemDetailMap = clientData.itemDetailMap;
+        }
+        // v1.37.0 — combat-trial boss stats: keep the payload tiny by
+        // pushing only the /monsters/trial_* entries of
+        // combatMonsterDetailMap (8 small blocks) plus the week-independent
+        // guild-trial table when it is part of the client data. The same
+        // capture also ships the game-data maps the ledger's combat
+        // simulator engine needs (buildSimGameData), minus the duplicated
+        // itemDetailMap which already ships at the top level of the push.
+        const monsterMap = clientData && clientData.combatMonsterDetailMap;
+        let trialMonsters = null;
+        if (monsterMap && typeof monsterMap === "object") {
+          trialMonsters = {};
+          for (const hrid of Object.keys(monsterMap)) {
+            if (hrid.indexOf("/monsters/trial_") === 0) {
+              trialMonsters[hrid] = monsterMap[hrid];
+            }
+          }
+          if (Object.keys(trialMonsters).length === 0) trialMonsters = null;
+        }
+        const simGameData = buildSimGameData(clientData);
+        if (trialMonsters || simGameData) {
+          result.combatTrialData = {
+            combatTrials: (clientData && typeof clientData.guildTrialDetailMap === "object")
+              ? clientData.guildTrialDetailMap
+              : null,
+            trialMonsters: trialMonsters,
+            gameData: simGameData,
+            source: "game client data (user-script capture)",
+            capturedAt: Date.now()
+          };
         }
       }
     } catch (e) {
       /* game API not present yet */
     }
-    return null;
+    return result;
   }
 
-  // Push the captured itemDetailMap to the ledger (one-time per page load).
+  // v1.37.0 — The game-data maps the ledger's combat-sim engine indexes,
+  // extracted from the same initClientData snapshot. Sized down where the
+  // game ships more than the sim ever indexes: actionDetailMap keeps
+  // /actions/combat/* only (the ledger injects its own synthetic boss zone
+  // before simming), combatMonsterDetailMap keeps the /monsters/trial_*
+  // entries with drop tables normalized to arrays (the engine walks
+  // rareDropTable without a null check). itemDetailMap is deliberately not
+  // duplicated here — it ships at the top level of the push and the ledger
+  // re-joins it into the blob before running the sim.
+  function buildSimGameData(clientData) {
+    if (!clientData || typeof clientData !== "object") return null;
+    const gameData = {};
+    const passthroughKeys = [
+      "abilityDetailMap",
+      "combatStyleDetailMap",
+      "damageTypeDetailMap",
+      "houseRoomDetailMap",
+      "combatTriggerDependencyDetailMap",
+      "combatTriggerConditionDetailMap",
+      "combatTriggerComparatorDetailMap",
+      "enhancementLevelTotalBonusMultiplierTable",
+      "abilitySlotsLevelRequirementList",
+      "openableLootDropMap",
+      "labyrinthCrateDetailMap",
+      "guildBuffDetailMap",
+      "guildShrineDetailMap",
+      "achievementDetailMap",
+      "achievementTierDetailMap"
+    ];
+    let present = 0;
+    for (const key of passthroughKeys) {
+      const value = clientData[key];
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        gameData[key] = value;
+        present += 1;
+      } else if (Array.isArray(value)) {
+        gameData[key] = value;
+        present += 1;
+      }
+    }
+    const actionMap = clientData.actionDetailMap;
+    if (actionMap && typeof actionMap === "object") {
+      const combatActions = {};
+      for (const hrid of Object.keys(actionMap)) {
+        if (hrid.indexOf("/actions/combat/") === 0) {
+          combatActions[hrid] = actionMap[hrid];
+        }
+      }
+      gameData.actionDetailMap = combatActions;
+      present += 1;
+    }
+    const monsterMap = clientData.combatMonsterDetailMap;
+    if (monsterMap && typeof monsterMap === "object") {
+      const trialOnly = {};
+      for (const hrid of Object.keys(monsterMap)) {
+        if (hrid.indexOf("/monsters/trial_") !== 0) continue;
+        const m = monsterMap[hrid] && typeof monsterMap[hrid] === "object" ? monsterMap[hrid] : {};
+        trialOnly[hrid] = Object.assign({}, m, {
+          dropTable: Array.isArray(m.dropTable) ? m.dropTable : [],
+          rareDropTable: Array.isArray(m.rareDropTable) ? m.rareDropTable : []
+        });
+      }
+      gameData.combatMonsterDetailMap = trialOnly;
+      present += 1;
+    }
+    // A few maps is too little to run the engine — require a working core.
+    return present >= 5 ? gameData : null;
+  }
+
+  // Push the captured client data to the ledger (one-time per page load).
   async function pushClientData(apiBase) {
     if (clientDataSent) return null;
-    const itemDetailMap = readItemDetailMap();
+    const captured = readClientData();
+    const itemDetailMap = captured.itemDetailMap;
     if (!itemDetailMap || Object.keys(itemDetailMap).length === 0) {
       return "itemDetailMap not available yet — retry after the game has fully loaded.";
     }
-    const res = await gmRequest("POST", `${apiBase}/api/client-data`, { itemDetailMap });
+    const body = { itemDetailMap };
+    if (captured.combatTrialData) body.combatTrialData = captured.combatTrialData;
+    const res = await gmRequest("POST", `${apiBase}/api/client-data`, body);
     if (res.status === 200) {
       clientDataSent = true;
-      const body = JSON.parse(res.responseText);
-      return `Pushed itemDetailMap (${body.size} items) to the ledger.`;
+      const parsed = JSON.parse(res.responseText);
+      const ct = captured.combatTrialData || null;
+      let extra;
+      if (!ct) {
+        extra = " (no trial boss data captured yet)";
+      } else {
+        extra = " + combat-sim data";
+        if (ct.trialMonsters) {
+          extra += ` (${Object.keys(ct.trialMonsters).length} trial monsters)`;
+        }
+        if (ct.gameData) extra += " + engine game-data maps";
+      }
+      return `Pushed itemDetailMap (${parsed.size} items)${extra} to the ledger.`;
     }
     return `Client-data push failed (${res.status}): ${res.responseText}`;
   }
@@ -2764,6 +3131,874 @@
   // The game carries them in `guildWeeklyTrialSet.combatHrids` (e.g.
   // ["/guild_combat/badger", "/guild_combat/swarm"]); the weekly set also
   // resets on a new guild week, so a fresh capture is authoritative.
+  // =====================================================================
+  // Weekly trial snapshot — the module functions
+  // (state lives with the other capture state, near the top of the file,
+  // so sweep() can never hit a TDZ gap on a late page load).
+  // =====================================================================
+
+  const snapPad2 = (n) => (n < 10 ? "0" + n : String(n));
+
+  // The game's week anchors (guild.currentWeekStartAt, the signup entries'
+  // signupWeekStartAt) arrive as ISO-8601 strings ("2026-10-30T00:00:00Z")
+  // in current builds — older builds used ms epochs — so accept both. The
+  // game's own helpers (ci.currentWeekStartMs) date-parse the same way.
+  function weekStartToMs(v) {
+    if (v === null || v === undefined) return NaN;
+    if (typeof v === "number") return Number.isFinite(v) && v > 0 ? v : NaN;
+    const s = String(v).trim();
+    if (!s) return NaN;
+    if (/^\d+$/.test(s)) {
+      const n = Number(s);
+      return Number.isFinite(n) && n > 0 && n < 1e15 ? n : NaN;
+    }
+    const t = Date.parse(s);
+    return Number.isFinite(t) && t > 0 ? t : NaN;
+  }
+
+  // Week key of the game's weekly cycle: the UTC calendar date
+  // ("YYYY-MM-DD") on which the guild week STARTS — guild trials reset
+  // every Friday at 00:00 UTC, so for current builds the anchor
+  // (guild.currentWeekStartAt) is exactly that Friday, and its UTC date
+  // is one stable, chronologically ordering key per game week. (The old
+  // "YYYY-Www" ISO-week key mislabeled the range: a Friday-start week
+  // sits in the MIDDLE of an ISO week, not on its Monday boundary.)
+  let nonFridayAnchorWarned = false;
+  function weekKeyFromStart(ts) {
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return null;
+    if (d.getUTCDay() !== 5 && !nonFridayAnchorWarned) {
+      // The anchor should be the Friday 00:00 UTC reset; if a future
+      // build moves the reset day, the key still tracks the actual anchor.
+      console.warn(
+        `[STL] week anchor ${new Date(ts).toISOString()} is not a Friday — using its UTC date as the week key anyway`
+      );
+      nonFridayAnchorWarned = true;
+    }
+    return d.getUTCFullYear() + "-" + snapPad2(d.getUTCMonth() + 1) + "-" + snapPad2(d.getUTCDate());
+  }
+
+  const normTrialStatus = (v) => {
+    if (typeof v !== "string") return null;
+    const s = v.trim().toLowerCase();
+    return s === "scheduled" || s === "in_progress" || s === "completed" ? s : null;
+  };
+
+  // Merge one member's signup fields into the capture buffer. Only
+  // non-empty values overwrite, so a partial update never blanks an
+  // earlier capture. Updates stamped for a different week (the game
+  // carries signupWeekStartAt on each entry) are dropped — a stale
+  // old-week broadcast must not leak into the new week's buffer.
+  function mergeSnapshotSignup(characterId, patch) {
+    if (characterId === null || characterId === undefined) return;
+    const key = Number(characterId);
+    if (!Number.isInteger(key) || key <= 0) return;
+    const stampedWeek = weekStartToMs(patch.signupWeekStartAt);
+    const trackedWeek = weekStartToMs(trialsSnapshot.weekStartAt);
+    if (
+      Number.isFinite(stampedWeek) &&
+      Number.isFinite(trackedWeek) &&
+      Math.abs(stampedWeek - trackedWeek) > 86400000
+    ) {
+      return;
+    }
+    const cur = trialsSnapshot.signups[key] || {};
+    if (patch.name) cur.name = String(patch.name);
+    const prevSkilling = cur.skilling || null;
+    const prevCombat = cur.combat || null;
+    for (const kind of ["skilling", "combat"]) {
+      const p = patch[kind];
+      if (!p) continue;
+      const k = cur[kind] || {};
+      if (p.trialHrid) k.trialHrid = String(p.trialHrid);
+      if (p.loadoutId !== null && p.loadoutId !== undefined && p.loadoutId !== "") {
+        const n = Number(p.loadoutId);
+        if (Number.isInteger(n) && n > 0) k.loadoutId = n;
+      }
+      if (p.roleHrid) k.roleHrid = String(p.roleHrid);
+      if (k.trialHrid || k.loadoutId || k.roleHrid) cur[kind] = k;
+    }
+    if (cur.name || cur.skilling || cur.combat) trialsSnapshot.signups[key] = cur;
+    // A mid-week (re)signup changes the loadout the member will actually
+    // run — drop any cached trial-loadout capture so the next button run
+    // re-fetches the loadout they signed up with.
+    const prevByKind = { skilling: prevSkilling, combat: prevCombat };
+    for (const kind of ["skilling", "combat"]) {
+      const prev = prevByKind[kind];
+      const now = cur[kind] || null;
+      const unchanged =
+        (prev && now &&
+          (prev.trialHrid || "") === (now.trialHrid || "") &&
+          (prev.loadoutId || 0) === (now.loadoutId || 0)) ||
+        (!prev && !now);
+      if (!unchanged && trialsSnapshot.trialLoadouts[key + ":" + kind]) {
+        delete trialsSnapshot.trialLoadouts[key + ":" + kind];
+      }
+    }
+  }
+
+  // Field extractor for the {Skilling,Combat}-suffixed signup fields the
+  // game carries on each character entry (the role field only exists for
+  // combat signups — the game returns "" otherwise).
+  function signupPatch(d, prefix) {
+    const field = (base) => (d && d[base] !== undefined ? d[base] : null);
+    let loadoutRaw = field(prefix + "LoadoutID");
+    const loadoutNum = loadoutRaw === null || loadoutRaw === "" ? null : Number(loadoutRaw);
+    return {
+      trialHrid: typeof field(prefix + "TrialHrid") === "string" ? field(prefix + "TrialHrid") : null,
+      loadoutId: Number.isInteger(loadoutNum) && loadoutNum > 0 ? loadoutNum : null,
+      roleHrid: typeof field(prefix + "RoleHrid") === "string" ? field(prefix + "RoleHrid") : null
+    };
+  }
+
+  // WS: guild_trial_stats_updated. The game's own handler stores the list
+  // only when e.guildId matches the joined guild; we mirror that guard.
+  function captureSnapshotStats(msg) {
+    if (!msg || typeof msg !== "object") return;
+    if (!Array.isArray(msg.guildTrialStatList)) return;
+    if (msg.guildId != null && detectedGuildId != null) {
+      const gid = Number(msg.guildId);
+      if (Number.isInteger(gid) && gid !== detectedGuildId) return; // another guild's traffic
+    }
+    trialsSnapshot.statRows = msg.guildTrialStatList.slice();
+    trialsSnapshot.statListUpdatedAt = Date.now();
+    console.log(`[STL] captured guild trial stats: ${trialsSnapshot.statRows.length} rows (guild ${msg.guildId})`);
+  }
+
+  // WS: guild_trial_signup_updated. The game's handler reads
+  // characterId and the signedUp* fields off the message top level and
+  // merges them into guildCharacterDict[characterId]; a {characterId,
+  // data:{…}} shape is tolerated too in case a future build wraps it.
+  function captureSnapshotSignup(msg) {
+    if (!msg || typeof msg !== "object") return;
+    const d = msg.data && typeof msg.data === "object" ? msg.data : msg;
+    const cid = msg.characterId !== undefined && msg.characterId !== null ? msg.characterId : d.characterId;
+    if (cid === undefined || cid === null) return;
+    mergeSnapshotSignup(cid, {
+      name: d.name || d.characterName || d.character_name || null,
+      signupWeekStartAt: d.signupWeekStartAt,
+      skilling: signupPatch(d, "signedUpSkilling"),
+      combat: signupPatch(d, "signedUpCombat")
+    });
+    // A (re)signup is cached above; the roster overlay's "⚙ Trial
+    // Loadouts" button picks the new loadout up on its next run (manual
+    // by design).
+  }
+
+  // Called from every guild-bearing message (init_character_data,
+  // guild_characters_updated, guild_updated). Records this week's trial
+  // statuses + per-member signups, and — when the message carries a NEW
+  // guild.currentWeekStartAt — pushes the just-ended week's captured
+  // buffer under the old weekKey (the game clears its stat list in the
+  // same message, so this is the last chance for the old week's data)
+  // before resetting the capture state for the new week. Rollover
+  // pushes deliberately do NOT refresh the live stat list: by the time
+  // the new week's anchor arrives, the list already belongs to it.
+  function trackGuildTrialWeek(msg) {
+    if (!msg || typeof msg !== "object") return;
+    const guild =
+      (msg.guild && typeof msg.guild === "object") ? msg.guild :
+      (msg.myGuild && typeof msg.myGuild === "object") ? msg.myGuild :
+      (msg.guildInfo && typeof msg.guildInfo === "object") ? msg.guildInfo :
+      (msg.characterData && msg.characterData.guild && typeof msg.characterData.guild === "object")
+        ? msg.characterData.guild : null;
+    // Per-member signup state (the full map is present on
+    // guild_characters_updated — the Guild-panel-open message).
+    const charMap = (guild && guild.guildCharacterMap) || msg.guildCharacterMap || null;
+    const sharable = (guild && guild.guildSharableCharacterMap) || msg.guildSharableCharacterMap || {};
+    if (charMap && typeof charMap === "object") {
+      for (const cid of Object.keys(charMap)) {
+        const c = charMap[cid] || {};
+        const name = (sharable[cid] && sharable[cid].name) || c.name || null;
+        mergeSnapshotSignup(cid, {
+          name,
+          signupWeekStartAt: c.signupWeekStartAt,
+          skilling: signupPatch(c, "signedUpSkilling"),
+          combat: signupPatch(c, "signedUpCombat")
+        });
+      }
+    }
+    if (!guild) return;
+    // Refresh this week's trial statuses from the game's payload.
+    if (typeof guild.currentTrialsData === "string" && guild.currentTrialsData) {
+      try {
+        const parsed = JSON.parse(guild.currentTrialsData) || {};
+        const s = {
+          skilling: parsed.skilling ? normTrialStatus(parsed.skilling.status) : null,
+          combat: parsed.combat ? normTrialStatus(parsed.combat.status) : null
+        };
+        if (s.skilling || s.combat) {
+          trialsSnapshot.statuses = {
+            skilling: s.skilling || trialsSnapshot.statuses.skilling,
+            combat: s.combat || trialsSnapshot.statuses.combat
+          };
+        }
+        // Same payload also carries the per-trial tile values: earned
+        // points (points[<trialHrid>]) and each trial's party state
+        // (skilling|combat -> parties -> <trialHrid> -> { done,
+        // highestTier, nextTierProgress }). Keyed by the trial's FULL
+        // hrid — the same key the snapshot entries use for trial_id — so
+        // a push can mirror the in-game Guild -> Trials tile (tier line +
+        // "N pts") at the top of each History table.
+        if (parsed && typeof parsed === "object") {
+          const points = (parsed.points && typeof parsed.points === "object")
+            ? parsed.points : {};
+          for (const kind of ["skilling", "combat"]) {
+            const block = parsed[kind];
+            if (!block || typeof block !== "object") continue;
+            const parties = (block.parties && typeof block.parties === "object")
+              ? block.parties : {};
+            for (const hrid of Object.keys(parties)) {
+              const party = parties[hrid];
+              if (!party || typeof party !== "object") continue;
+              trialsSnapshot.trialProgress[hrid] = {
+                kind,
+                points: Number(points[hrid]) || 0,
+                tier: Number(party.highestTier) || 0, // 1-based (11 -> "Lv.200")
+                progress: Number(party.nextTierProgress) || 0,
+                done: Boolean(party.done),
+                capturedAt: Date.now()
+              };
+            }
+          }
+        }
+      } catch (e) { /* keep the previous statuses */ }
+    }
+    const weekStart = weekStartToMs(guild.currentWeekStartAt);
+    if (!Number.isFinite(weekStart)) return;
+    if (trialsSnapshot.weekStartAt === weekStart) {
+      // Same week — statuses just refreshed; if both trials are now done,
+      // this week is final and can be snapshotted.
+      maybeCompletionSnapshot();
+      return;
+    }
+    // NEW week (or first capture): roll the buffer forward.
+    const oldKey = trialsSnapshot.weekKey;
+    const oldRows = trialsSnapshot.statRows;
+    const oldSignups = trialsSnapshot.signups;
+    const oldLoadouts = trialsSnapshot.trialLoadouts; // mid-week captures of the old week
+    const oldProgress = trialsSnapshot.trialProgress; // old week's per-trial tile values
+    const oldPending = trialsSnapshot.pendingViewLoadouts.slice();
+    trialsSnapshot.weekStartAt = weekStart;
+    trialsSnapshot.weekKey = weekKeyFromStart(weekStart);
+    trialsSnapshot.statRows = []; // statListUpdatedAt is kept: a rollover does not touch the live list
+    trialsSnapshot.signups = {};
+    // The server's guild-trial context ROLLS in this same message — from
+    // here on a view_loadout would return the NEW week's loadouts, so the
+    // old week rides up with whatever we already captured mid-week (and
+    // any in-flight answer is abandoned: it belongs to the new week).
+    trialsSnapshot.trialLoadouts = {};
+    trialsSnapshot.trialProgress = {}; // captured values belong to the old week now
+    for (const req of oldPending) { if (req.settle) req.settle(null); }
+    trialsSnapshot.pendingViewLoadouts = [];
+    if (oldKey && (hasSnapshotData(oldRows, oldSignups) || Object.keys(oldProgress).length > 0)) {
+      void pushTrialSnapshot(oldKey, {
+        apiBase: snapshotApiBase(),
+        buffer: { statRows: oldRows, signups: oldSignups, trialLoadouts: oldLoadouts, trialStats: oldProgress },
+        reason: "rollover"
+      });
+    }
+    // Re-login after this week already completed: catch up now.
+    maybeCompletionSnapshot();
+  }
+
+  function hasSnapshotData(rows, signups) {
+    if (Array.isArray(rows) && rows.length > 0) return true;
+    if (signups && typeof signups === "object") {
+      for (const key of Object.keys(signups)) {
+        const s = signups[key];
+        if (!s) continue;
+        for (const kind of ["skilling", "combat"]) {
+          if (s[kind] && s[kind].trialHrid) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // How much capture data exists (stat rows + per-member signup entries
+  // + captured trial loadouts): used to decide whether a completed week
+  // gained NEW data after its first push (e.g. signup/loadout info
+  // arriving when the Guild panel opens after the login-time push, or a
+  // mid-week trial-loadout sweep landing), worth an upsert re-push.
+  function snapshotRichness(rows, signups, loadouts) {
+    let n = Array.isArray(rows) ? rows.length : 0;
+    if (signups && typeof signups === "object") {
+      for (const key of Object.keys(signups)) {
+        const s = signups[key];
+        if (!s) continue;
+        if (s.skilling) n += 1;
+        if (s.combat) n += 1;
+      }
+    }
+    if (loadouts && typeof loadouts === "object") {
+      n += Object.keys(loadouts).length;
+    }
+    return n;
+  }
+
+  // Completion trigger: both of this week's trials report "completed"
+  // and this week hasn't been pushed yet -> capture the final state. A
+  // week already pushed re-pushes only when strictly richer data arrived
+  // since (the server upserts, so this just refreshes the rows).
+  function maybeCompletionSnapshot() {
+    const s = trialsSnapshot;
+    if (s.pushInFlight || !s.weekKey) return;
+    if (s.statuses.skilling !== "completed" || s.statuses.combat !== "completed") return;
+    if (s.lastPushedWeekKey === s.weekKey) {
+      const richer = snapshotRichness(s.statRows, s.signups, s.trialLoadouts) > s.lastPushRichness;
+      // The per-trial tile values can advance even when the data COUNT is
+      // flat (a tier/points bump after the first push) — a different
+      // serialized set is also worth the re-push.
+      const statsChanged = JSON.stringify(serializeTrialStats(s.trialProgress || {}))
+        !== (s.lastPushTrialStats || "[]");
+      if (!richer && !statsChanged) return;
+    }
+    if (Date.now() - s.lastPushAt < SNAPSHOT_PUSH_COOLDOWN_MS) return; // retry next window
+    void pushTrialSnapshot(s.weekKey, { apiBase: snapshotApiBase(), reason: "completed" });
+  }
+
+  // Lazy hrid -> item-detail lookup from the game's client data (the same
+  // map we push to the ledger) — used to name the gear in a signed-up
+  // loadout. An empty result (game client data not loaded yet) is NOT
+  // cached, so a later push can re-resolve names.
+  function ensureItemNameMap() {
+    const cached = trialsSnapshot.itemNameMap;
+    if (cached && Object.keys(cached).length > 0) return cached;
+    let map = {};
+    try {
+      const detail = readClientData().itemDetailMap;
+      if (detail && typeof detail === "object") {
+        for (const hrid of Object.keys(detail)) {
+          const v = detail[hrid];
+          if (v && typeof v === "object") map[hrid] = v;
+        }
+      }
+    } catch (e) { /* game client data not ready */ }
+    if (Object.keys(map).length > 0) trialsSnapshot.itemNameMap = map;
+    return map;
+  }
+
+  // Best-effort gear-name resolution for the loadout a member signed up
+  // with: their captured profile (a full guild pull stores every
+  // loadout by the SAME loadoutId) lists the equipment, and the game's
+  // itemDetailMap supplies display names. Returns the History page's
+  // { group: [{name, count}] } shape, or null when this client never
+  // captured that member's loadouts (the entry then still carries the
+  // raw loadoutId).
+  function resolveLoadoutGroup(memberId, loadoutId) {
+    if (loadoutId === null || loadoutId === undefined) return null;
+    const n = Number(loadoutId);
+    if (!Number.isInteger(n) || n <= 0) return null;
+    const prof =
+      (pulledProfilesFull && pulledProfilesFull[memberId]) ||
+      (pulledProfilesFull && pulledProfilesFull[String(memberId)]) || null;
+    if (!prof || !Array.isArray(prof.loadouts)) return null;
+    const lo = prof.loadouts.find((l) => l && Number(l.loadoutId) === n) || null;
+    if (!lo || !Array.isArray(lo.equipment) || lo.equipment.length === 0) return null;
+    const items = [];
+    const names = ensureItemNameMap();
+    const seen = {};
+    for (const eq of lo.equipment) {
+      if (!eq || !eq.itemHrid) continue;
+      const d = names[eq.itemHrid];
+      const name =
+        (d && (typeof d.name === "string" ? d.name : (d.displayName || d.itemName || ""))) ||
+        String(eq.itemHrid).split("/").pop();
+      if (!name || seen[name]) continue;
+      seen[name] = true;
+      items.push({ name, count: 1 });
+    }
+    if (items.length === 0) return null;
+    return { Equipment: items };
+  }
+
+  // -------------------------------------------------------------------
+  // Signed-up TRIAL loadouts (feeds the History page's gear menu: the
+  // loadout each member actually used, captured from the game MID-WEEK
+  // instead of a "currently equipped" snapshot from a later profile pull).
+  //
+  // WS protocol (verified against the live game, online + offline members):
+  //   send  { type: "view_loadout",
+  //           viewLoadoutData: { characterId,
+  //                              context: "guild_trial",
+  //                              kind: "skilling" | "combat" } }
+  //   recv  { type: "loadout_shared",
+  //           loadout: { sharableCharacter: { name, isOnline, ... },
+  //                     hasLoadout, actionTypeHrid,
+  //                     wearableItemMap: { <locationHrid>:
+  //                       { itemHrid, enhancementLevel, ... } },
+  //                     equippedAbilities: [{ abilityHrid, level, ... }],
+  //                     combatConsumables: [{ itemHrid, enhancementLevel,
+  //                       count, ... }] } }
+  // context and kind are BOTH required — the server silently drops a
+  // request without a valid trial kind, and JSON.stringify strips an
+  // undefined kind, so the kind is always passed explicitly. Responses
+  // carry no characterID of their own, so we match them to pending
+  // requests by the echoed character name (guild names are unique) with
+  // FIFO as the fallback.
+  // -------------------------------------------------------------------
+
+  // Reduce a loadout_shared payload to the compact shape the snapshot
+  // stores: gear per location (with the item's equipment type, so the
+  // page can label the slot without fresh client data), the loadout's
+  // equipped abilities, and — for combat — the consumables.
+  function normalizeTrialLoadoutResponse(characterId, kind, lo, fallbackName) {
+    const wm = (lo && typeof lo.wearableItemMap === "object" && lo.wearableItemMap) || {};
+    const names = ensureItemNameMap();
+    const equipment = [];
+    for (const slot of Object.keys(wm)) {
+      const it = wm[slot];
+      if (!it || !it.itemHrid) continue;
+      const enh = Number(it.enhancementLevel);
+      const det = names[it.itemHrid];
+      const ed = det && det.equipmentDetail;
+      equipment.push({
+        slot,
+        itemHrid: String(it.itemHrid),
+        enhancementLevel: Number.isFinite(enh) ? enh : 0,
+        // e.g. "/equipment_types/hands" — the page labels the slot from
+        // this even when its own game-data table lacks the item.
+        slotType: ed && typeof ed.type === "string" && ed.type ? ed.type : null
+      });
+    }
+    const abilities = [];
+    if (lo && Array.isArray(lo.equippedAbilities)) {
+      for (const a of lo.equippedAbilities) {
+        if (!a || !a.abilityHrid) continue;
+        const lvl = Number(a.level);
+        abilities.push({
+          abilityHrid: String(a.abilityHrid),
+          level: Number.isFinite(lvl) && lvl > 0 ? Math.floor(lvl) : 1
+        });
+      }
+    }
+    const consumables = [];
+    if (kind === "combat" && lo && Array.isArray(lo.combatConsumables)) {
+      for (const c of lo.combatConsumables) {
+        if (!c || !c.itemHrid) continue;
+        const enh = Number(c.enhancementLevel);
+        const cnt = Number(c.count);
+        consumables.push({
+          itemHrid: String(c.itemHrid),
+          enhancementLevel: Number.isFinite(enh) ? enh : 0,
+          count: Number.isFinite(cnt) ? cnt : 1
+        });
+      }
+    }
+    const sc = (lo && typeof lo.sharableCharacter === "object" && lo.sharableCharacter) || {};
+    return {
+      characterId: Number(characterId),
+      kind,
+      name: typeof sc.name === "string" && sc.name ? sc.name : fallbackName || null,
+      // The game's own flag, with a content fallback (a loadout can exist
+      // with hasLoadout false in edge cases — gear that is still there).
+      hasLoadout: lo.hasLoadout === true ||
+        equipment.length > 0 || abilities.length > 0 || consumables.length > 0,
+      actionTypeHrid:
+        lo && typeof lo.actionTypeHrid === "string" && lo.actionTypeHrid
+          ? lo.actionTypeHrid
+          : (typeof sc.actionType === "string" && sc.actionType ? sc.actionType : null),
+      equipment,
+      abilities,
+      consumables,
+      resolvedAt: Date.now()
+    };
+  }
+
+  // Send one view_loadout request and resolve with the matching
+  // loadout_shared payload (or null on timeout/socket failure). The
+  // answer is settled by handleSharedLoadoutResponse when it arrives.
+  function requestViewLoadout(characterId, kind, name) {
+    return new Promise((resolve) => {
+      const cid = Number(characterId);
+      if (!Number.isInteger(cid) || cid <= 0) { resolve(null); return; }
+      const req = {
+        characterId: cid,
+        kind,
+        name: name || null,
+        settled: false,
+        timer: null,
+        settle: null
+      };
+      req.settle = (lo) => {
+        if (req.settled) return;
+        req.settled = true;
+        if (req.timer) { clearTimeout(req.timer); req.timer = null; }
+        const i = trialsSnapshot.pendingViewLoadouts.indexOf(req);
+        if (i >= 0) trialsSnapshot.pendingViewLoadouts.splice(i, 1);
+        resolve(lo || null);
+      };
+      trialsSnapshot.pendingViewLoadouts.push(req);
+      req.timer = setTimeout(() => req.settle(null), TRIAL_LOADOUT_FETCH.timeoutMs);
+      try {
+        gameSocket.send(JSON.stringify({
+          type: "view_loadout",
+          viewLoadoutData: {
+            characterId: cid,
+            context: "guild_trial",
+            kind
+          },
+          ts: Date.now()
+        }));
+      } catch (e) {
+        req.settle(null); // socket vanished between check and send
+      }
+    });
+  }
+
+  // WS: loadout_shared. Match the answer to a pending view_loadout —
+  // by the member name the server echoes when present (so the game's own
+  // UI requesting a loadout mid-burst can never consume one of OUR
+  // pending slots) — and cache the normalized loadout keyed
+  // "characterId:kind" for the snapshot's entries.
+  function handleSharedLoadoutResponse(msg) {
+    if (!msg || typeof msg !== "object") return;
+    const lo = msg.loadout && typeof msg.loadout === "object" ? msg.loadout : null;
+    if (!lo) return;
+    const q = trialsSnapshot.pendingViewLoadouts;
+    if (!q.length) return; // unsolicited (e.g. the game's party UI)
+    const sc = lo.sharableCharacter || {};
+    const who = typeof sc.name === "string" ? sc.name.toLowerCase() : null;
+    let req = null;
+    if (who) {
+      const i = q.findIndex((r) => r.name && r.name.toLowerCase() === who);
+      if (i === -1) return; // not ours — never shift the FIFO for it
+      req = q.splice(i, 1)[0];
+    } else {
+      req = q.shift();
+    }
+    if (!req) return;
+    const stored = normalizeTrialLoadoutResponse(req.characterId, req.kind, lo, req.name);
+    trialsSnapshot.trialLoadouts[req.characterId + ":" + req.kind] = stored;
+    console.log(`[STL] captured trial loadout: ${(stored.name || "member " + req.characterId)} (${req.kind}, ${stored.equipment.length} gear)`);
+    req.settle(lo);
+  }
+
+  // Burst: fetch the signed-up loadout for every (member, kind) pair
+  // signed up this week that we don't have cached yet. Invoked from the
+  // roster overlay's "⚙ Trial Loadouts" button (manual by design) — a pass
+  // only pays for what's missing (cached pairs are skipped). Sequential,
+  // one request per second (TRIAL_LOADOUT_FETCH.gapMs) so a full roster
+  // takes a few minutes; the name-matched FIFO still tolerates slow
+  // answers. Returns this pass's count; the optional `onProgress(done,
+  // total, captured)` callback reports per-request progress to the caller
+  // (the roster overlay's footer line).
+  async function fetchWeekTrialLoadouts(onProgress) {
+    if (loadoutBurstRunning || !socketReady()) return 0;
+    const s = trialsSnapshot;
+    const targets = [];
+    for (const key of Object.keys(s.signups)) {
+      const su = s.signups[key];
+      if (!su) continue;
+      const cid = Number(key);
+      if (!Number.isInteger(cid) || cid <= 0) continue;
+      for (const kind of ["skilling", "combat"]) {
+        const k = su[kind];
+        if (!k || !k.trialHrid) continue; // not signed up for that trial
+        if (s.trialLoadouts[cid + ":" + kind]) continue; // already cached
+        targets.push({ cid, kind, name: su.name || null });
+      }
+      if (targets.length >= TRIAL_LOADOUT_FETCH.maxTargets) break;
+    }
+    if (!targets.length) return 0;
+    loadoutBurstRunning = true;
+    // While this is true, the socket hook keeps the game's "X's Loadout"
+    // popups closed (see neuterLoadoutFrameForGame). Belt and braces — the
+    // same trick the roster "Pull" button uses for the profile popup: a
+    // <style> that display:none's the game's SharableProfile modal classes
+    // (CSS-module hashes from the CURRENT game build; if they ever drift,
+    // the frame-neuter hook is the second line of defense). Removed in the
+    // finally so the game UI is untouched again as soon as the burst ends.
+    const hideStyleId = "stl-hide-loadout-modal";
+    let hideStyle = null;
+    try {
+      hideStyle = document.createElement("style");
+      hideStyle.id = hideStyleId;
+      hideStyle.textContent = ".SharableProfile_modalContainer__6Q2JL, .SharableProfile_background__1nCL5, .SharableProfile_modal__2OmCQ { display: none !important; }";
+      document.head.appendChild(hideStyle);
+    } catch (e) { /* cosmetic guard only — the frame neuter still applies */ }
+    console.log("[STL] trial loadout burst started — in-game loadout popups stay closed for the run");
+    let captured = 0;
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        const t = targets[i];
+        const lo = await requestViewLoadout(t.cid, t.kind, t.name);
+        if (lo) captured += 1;
+        if (onProgress) {
+          try { onProgress(i + 1, targets.length, captured); } catch (e) { /* UI hook only */ }
+        }
+        await sleep(TRIAL_LOADOUT_FETCH.gapMs);
+      }
+    } finally {
+      loadoutBurstRunning = false;
+      if (hideStyle && hideStyle.parentNode) {
+        try { hideStyle.parentNode.removeChild(hideStyle); } catch (e) {
+          // The node may already be gone (page teardown); either way the
+          // burst has stopped, nothing to retry.
+        }
+      }
+    }
+    if (captured) {
+      console.log(`[STL] trial loadout burst: ${captured} of ${targets.length} remaining loadouts captured`);
+    }
+    return captured;
+  }
+
+  // v1.37.0: loadout fetching is MANUAL ONLY — the panel's "⚙ Trial
+  // Loadouts" button is the sole trigger (there are no auto-sweeps and
+  // pushes no longer gap-fill). The SERVER CONTEXT ROLLS at the weekly
+  // reset, so anything the button cached MID-WEEK is what rides along
+  // with the next push (a rollover push carries the old week's cached
+  // map; a fresh burst mid-week paces one view_loadout per second).
+
+  const toStatNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+  // Flatten a capture buffer into the ledger's entry shape — one row per
+  // (member, kind, trial): first the guild-wide stat rows (actual
+  // participants), then any signed-up member who has no stat row (out for
+  // the trial). data carries the game's stat fields plus the signup's
+  // loadoutId/roleHrid, the resolved gear names (profile pull, when this
+  // client ran one) and — when captured this week — the member's actual
+  // signed-up TRIAL loadout (data.trialLoadout: gear per slot with the
+  // item's equipment type, the loadout's equipped abilities, and combat
+  // consumables), which the History page's gear menu shows in preference
+  // to the "currently equipped" profile snapshot.
+  function buildSnapshotEntries(statRows, signups, weekKey, loadouts) {
+    loadouts = loadouts || trialsSnapshot.trialLoadouts;
+    const entries = [];
+    const seen = {};
+    // The mid-week capture of this member's signed-up loadout for this
+    // trial, when the fetch covered it (null = not captured this client).
+    const trialLoadoutFor = (cid, kind) => {
+      const tl = (loadouts && (loadouts[cid + ":" + kind] || loadouts[String(cid) + ":" + kind])) || null;
+      if (!tl || tl.kind !== kind) return null;
+      return {
+        kind: tl.kind,
+        hasLoadout: !!tl.hasLoadout,
+        actionTypeHrid: tl.actionTypeHrid || null,
+        equipment: (tl.equipment || []).slice(),
+        abilities: (tl.abilities || []).slice(),
+        consumables: (tl.consumables || []).slice()
+      };
+    };
+    const nameFor = (cid) => {
+      const s = signups[cid];
+      if (s && s.name) return s.name;
+      const m = guildMembers.find((g) => g && Number(g.characterId) === Number(cid));
+      return m ? String(m.characterName) : null;
+    };
+    const addEntry = (cid, kind, hrid, data) => {
+      if (hrid === null || hrid === undefined) return;
+      const key = Number(cid) + "|" + kind + "|" + String(hrid).toLowerCase();
+      if (seen[key]) return;
+      seen[key] = true;
+      const name = nameFor(cid);
+      entries.push({
+        memberId: Number(cid),
+        memberName: name ? String(name).slice(0, 80) : "",
+        trialKind: kind,
+        trialId: String(hrid).toLowerCase(),
+        capturedAt: Date.now(),
+        data
+      });
+    };
+    if (Array.isArray(statRows)) {
+      for (const row of statRows) {
+        if (!row || row.characterId === undefined || row.characterId === null || !row.trialHrid) continue;
+        const cid = Number(row.characterId);
+        if (!Number.isInteger(cid) || cid <= 0) continue;
+        const kind = String(row.trialHrid).indexOf("/guild_combat/") === 0 ? "combat" : "skilling";
+        const su = (signups[cid] && signups[cid][kind]) || null;
+        const data = {
+          participant: true,
+          damageDealt: toStatNum(row.damageDealt),
+          healingDone: toStatNum(row.healingDone),
+          premitigatedDamageTaken: toStatNum(row.premitigatedDamageTaken),
+          workDone: toStatNum(row.workDone)
+        };
+        if (su) {
+          if (su.loadoutId != null) data.loadoutId = Number(su.loadoutId);
+          if (su.roleHrid) data.roleHrid = String(su.roleHrid);
+          const loadout = resolveLoadoutGroup(cid, su.loadoutId);
+          if (loadout) data.loadout = loadout;
+        }
+        // The actual signed-up loadout this week (mid-week capture) beats
+        // the profile-pull snapshot above; either may be absent.
+        const trialLoadout = trialLoadoutFor(cid, kind);
+        if (trialLoadout) data.trialLoadout = trialLoadout;
+        addEntry(cid, kind, row.trialHrid, data);
+      }
+    }
+    if (signups && typeof signups === "object") {
+      const ids = Object.keys(signups).map(Number).filter((n) => Number.isInteger(n) && n > 0);
+      for (const cid of ids) {
+        const s = signups[cid];
+        if (!s) continue;
+        for (const kind of ["skilling", "combat"]) {
+          const su = s[kind];
+          if (!su || !su.trialHrid) continue;
+          const data = { participant: false };
+          if (su.loadoutId != null) data.loadoutId = Number(su.loadoutId);
+          if (su.roleHrid) data.roleHrid = String(su.roleHrid);
+          const loadout = resolveLoadoutGroup(cid, su.loadoutId);
+          if (loadout) data.loadout = loadout;
+          const trialLoadout = trialLoadoutFor(cid, kind);
+          if (trialLoadout) data.trialLoadout = trialLoadout;
+          addEntry(cid, kind, su.trialHrid, data);
+        }
+      }
+    }
+    // Server cap: 500 entries per push (~40 players x ~9 trials max).
+    return entries.slice(0, 500);
+  }
+
+  function snapshotApiBase() {
+    try {
+      const b = cfgGet().apiBase;
+      return b ? String(b).replace(/\/+$/, "") : "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  // Ask the game to (re)send the week's guild-wide trial stat list —
+  // the same { type: "get_guild_trial_stats" } request the in-game Stats
+  // dialog fires — then wait (bounded) for the guild_trial_stats_updated
+  // answer, so a push records the server's current view even if this
+  // client was offline while the trials ran. Resolves true when a fresh
+  // answer arrived within the window.
+  function requestGuildTrialStats(timeoutMs) {
+    return new Promise((resolve) => {
+      let sent = false;
+      try {
+        if (gameSocket && typeof gameSocket.send === "function" && gameSocket.readyState === 1) {
+          gameSocket.send(JSON.stringify({ type: "get_guild_trial_stats" }));
+          sent = true;
+        }
+      } catch (e) { /* socket vanished between check and send */ }
+      if (!sent) { resolve(false); return; }
+      const stamp = trialsSnapshot.statListUpdatedAt;
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        clearInterval(tick);
+        clearTimeout(deadline);
+        resolve(v);
+      };
+      const tick = setInterval(() => {
+        if (trialsSnapshot.statListUpdatedAt !== stamp) finish(true);
+      }, 150);
+      const deadline = setTimeout(
+        () => finish(trialsSnapshot.statListUpdatedAt !== stamp),
+        timeoutMs || SNAPSHOT_STATS_REFRESH_MS
+      );
+    });
+  }
+
+  // The wire form of the captured per-trial tile values: one compact row
+  // per trial. The server re-derives the "Lv.N" the in-game tile shows
+  // from `tier` (100 + 10 * (tier - 1) — the game's own formula), so the
+  // client only ships tier/points/progress/done.
+  function serializeTrialStats(map) {
+    const out = [];
+    if (map && typeof map === "object") {
+      for (const hrid of Object.keys(map)) {
+        const p = map[hrid];
+        if (!p || typeof p !== "object") continue;
+        if (p.kind !== "skilling" && p.kind !== "combat") continue;
+        if (typeof hrid !== "string" || !hrid) continue;
+        out.push({
+          trialKind: p.kind,
+          trialId: hrid,
+          tier: Math.max(0, Math.round(Number(p.tier) || 0)),
+          points: Math.max(0, Math.round(Number(p.points) || 0)),
+          progress: Math.min(1, Math.max(0, Number(p.progress) || 0)),
+          done: Boolean(p.done),
+          capturedAt: Number(p.capturedAt) || Date.now()
+        });
+      }
+    }
+    return out;
+  }
+
+  // Push one week's snapshot to the ledger. `buffer` is optional: when
+  // omitted the LIVE capture state (this week) goes up, after a
+  // best-effort get_guild_trial_stats refresh (see above); a rollover
+  // push passes the OLD week's buffer explicitly and skips the refresh
+  // (the live list already belongs to the new week). All failure paths
+  // resolve with a human-readable string — a snapshot miss must never
+  // break the rest of the sweep.
+  async function pushTrialSnapshot(weekKey, opts) {
+    const o = opts || {};
+    const apiBase = o.apiBase || snapshotApiBase();
+    if (!weekKey || !apiBase || trialsSnapshot.pushInFlight) return null;
+    if (!o.force && trialsSnapshot.lastPushedWeekKey === weekKey) return null;
+    trialsSnapshot.pushInFlight = true;
+    try {
+      const buffer = o.buffer || null;
+      const live = buffer === null;
+      let rows, signups, loadouts, trialStats;
+      if (live) {
+        await requestGuildTrialStats(SNAPSHOT_STATS_REFRESH_MS);
+        // Re-read AFTER the refresh: captureSnapshotStats replaces
+        // trialsSnapshot.statRows with a new array when the answer
+        // arrives, so a pre-await reference would be stale/empty.
+        rows = trialsSnapshot.statRows;
+        signups = trialsSnapshot.signups;
+        // Trial loadouts are fetched ONLY by the roster overlay's "⚙ Trial
+        // Loadouts" button (manual by design — no burst is ever fired as a
+        // side effect of a push); whatever the button cached this week
+        // rides along here.
+        loadouts = trialsSnapshot.trialLoadouts;
+        trialStats = trialsSnapshot.trialProgress || {};
+      } else {
+        rows = buffer.statRows || [];
+        signups = buffer.signups || {};
+        loadouts = buffer.trialLoadouts || {}; // captured mid-week; a fresh burst is impossible after the server rolled the week
+        trialStats = buffer.trialStats || {}; // the OLD week's tile values, captured mid-week
+      }
+      const trialStatsWire = serializeTrialStats(trialStats);
+      console.log(`[STL] snapshot push ${weekKey} (${o.reason || "auto"}): rows=${rows.length}, signups=${Object.keys(signups).length}, loadouts=${Object.keys(loadouts).length}, trialStats=${trialStatsWire.length}, statsUpdated=${trialsSnapshot.statListUpdatedAt || "never"}`);
+      const entries = buildSnapshotEntries(rows, signups, weekKey, loadouts);
+      if (entries.length === 0 && trialStatsWire.length === 0) {
+        return "No participant or signup data for " + weekKey + " — nothing to snapshot.";
+      }
+      const res = await gmRequest("POST", `${apiBase}/api/trial-snapshots`, { weekKey, entries, trialStats: trialStatsWire });
+      if (res.status === 200) {
+        let upserted = entries.length;
+        try {
+          const p = JSON.parse(res.responseText);
+          if (p && Number.isFinite(Number(p.upserted))) upserted = Number(p.upserted);
+        } catch (e) { /* keep the local count */ }
+        trialsSnapshot.lastPushedWeekKey = weekKey;
+        trialsSnapshot.lastPushAt = Date.now();
+        trialsSnapshot.lastPushRichness = snapshotRichness(rows, signups, loadouts);
+        trialsSnapshot.lastPushTrialStats = JSON.stringify(trialStatsWire);
+        const okMsg = `Snapshot pushed: ${upserted} entries for ${weekKey} (${o.reason || "auto"}).`;
+        console.log("[STL] " + okMsg);
+        return okMsg;
+      }
+      const failMsg = `Snapshot push failed (${res.status}): ${res.responseText || ""}`.trim();
+      console.log("[STL] " + failMsg);
+      return failMsg;
+    } catch (err) {
+      const failMsg = `Snapshot push failed: ${err && err.message ? err.message : String(err)}`;
+      console.log("[STL] " + failMsg);
+      return failMsg;
+    } finally {
+      trialsSnapshot.pushInFlight = false;
+    }
+  }
+
+  // v1.37.0: the ledger's old "Snapshot now" pending-request round-trip
+  // (site button arms a request → this client's sweep polled it and
+  // dispatched the push) is gone — snapshots now go out exactly like the
+  // guild roster does: rollover/completion fire automatically, and a
+  // member's panel "Push Snapshot" button sends a direct guild-gated push
+  // (see buildPanel). No meta-poll of the ledger remains.
+
   function captureCombatTrials(msg) {
     if (!msg || typeof msg !== "object") return;
     const set = msg.guildWeeklyTrialSet;
@@ -3158,6 +4393,7 @@
     }
     #stl-update-banner[hidden] { display: none; }
     #stl-update-banner .stl-update-msg { flex: 1; }
+    #stl-update-banner .stl-update-link { color: #8a5a00; font-weight: 600; }
     #stl-update-banner .stl-update-dismiss {
       flex: none; background: transparent; border: none;
       color: #6b4c00; font: 600 12px system-ui, sans-serif;
@@ -3447,6 +4683,8 @@
     }
     #stl-overlay-toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
     #stl-ov-pull { background: linear-gradient(135deg, #667eea, #764ba2); }
+    #stl-ov-loadouts { background: #3a3f5c; }
+    #stl-ov-push-snapshot { background: #1f6f43; }
     #stl-ov-pause { background: #33344a; }
     #stl-ov-pause.stl-paused { background: #c0392b; }
     #stl-ov-push { background: #a86a0c; }
@@ -3475,6 +4713,32 @@
     .stl-ab-list { display: inline-flex; flex-wrap: wrap; gap: 3px 8px; }
     .stl-ab { white-space: nowrap; color: #cfd1e8; font-size: 11.5px; }
     .stl-ab b { color: #ffd700; font-weight: 600; }
+    /* v1.37.0 — gear tooltip: hover a member's name to see their loadouts
+       (equipment + enhancement), like the combat sim's character view. */
+    #stl-overlay-table td.stl-col-name { cursor: help; }
+    #stl-gear-tip {
+      position: fixed; z-index: 1000000; display: none; box-sizing: border-box;
+      min-width: 230px; max-width: 360px; max-height: 62vh; overflow-y: auto;
+      background: #1b1c26; border: 1px solid #3a3c52; border-radius: 8px;
+      box-shadow: 0 8px 28px rgba(0,0,0,0.55); padding: 10px 12px;
+      font: 12.5px system-ui, sans-serif; color: #d5d7ea;
+    }
+    #stl-gear-tip .stl-gt-name { font-size: 13px; font-weight: 700; color: #fff; }
+    #stl-gear-tip .stl-gt-id { color: #888aa5; font-weight: 400; font-size: 11px; }
+    #stl-gear-tip .stl-gt-loadout { margin-top: 8px; padding-top: 6px; border-top: 1px solid #2b2d40; }
+    #stl-gear-tip .stl-gt-lo-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; }
+    #stl-gear-tip .stl-gt-lo-name { font-weight: 600; color: #f0d98c; }
+    #stl-gear-tip .stl-gt-lo-skill { color: #888aa5; font-size: 11px; }
+    #stl-gear-tip .stl-gt-tag {
+      font-size: 10.5px; line-height: 15px; padding: 0 6px; border-radius: 8px;
+      background: #2b2d40; color: #b7b9cc; white-space: nowrap;
+    }
+    #stl-gear-tip .stl-gt-tag.trial { background: #4a3413; color: #ffd700; }
+    #stl-gear-tip .stl-gt-row { display: flex; gap: 8px; margin-top: 3px; }
+    #stl-gear-tip .stl-gt-slot { flex: 0 0 88px; color: #888aa5; font-size: 11.5px; }
+    #stl-gear-tip .stl-gt-item { color: #e8eaf3; }
+    #stl-gear-tip .stl-gt-enh { color: #79c0ff; font-weight: 600; font-size: 11px; margin-left: 4px; }
+    #stl-gear-tip .stl-gt-note { margin-top: 8px; color: #888aa5; font-size: 11.5px; font-style: italic; }
     #stl-overlay-empty { padding: 24px; text-align: center; color: #7d7f97; font-size: 12.5px; white-space: pre-line; }
     #stl-overlay-footer {
       padding: 10px 18px; border-top: 1px solid rgba(255,255,255,0.12);
@@ -3516,10 +4780,16 @@
 
   function setOverlayButtons(disabled) {
     if (!overlayEl) return;
-    for (const id of ["stl-ov-pull", "stl-ov-pause", "stl-ov-push"]) {
+    // v1.37.x: pull and the snapshot push lock the WHOLE toolbar (no
+    // concurrent runs); the trial-loadouts burst runs quietly in the
+    // background and locks ONLY its own button — that rule also has to
+    // survive any unlock that happens while the burst is mid-flight.
+    for (const id of ["stl-ov-pull", "stl-ov-pause", "stl-ov-push", "stl-ov-push-snapshot"]) {
       const b = overlayEl.querySelector("#" + id);
       if (b) b.disabled = disabled;
     }
+    const lo = overlayEl.querySelector("#stl-ov-loadouts");
+    if (lo) lo.disabled = disabled || loadoutBurstRunning;
     // While a pull runs, Pull stays enabled only as "Stop" via the pause btn;
     // Pull itself is disabled to avoid double-starts.
     const pull = overlayEl.querySelector("#stl-ov-pull");
@@ -3538,18 +4808,31 @@
       }
     }
 
-    // Minimized pill: show it only while a pull is running and the panel is
-    // minimized; the pull keeps running in the background either way.
-    const pill = overlayEl.querySelector("#stl-overlay-pill");
-    if (pill) {
-      const pillStatus = pill.querySelector(".stl-pill-status");
-      const visible = pullState.running && overlayState.minimized;
-      pill.classList.toggle("stl-pill-visible", visible);
-      if (visible) applyOverlayPillPosition(pill);
-      if (visible && pillStatus) {
-        pillStatus.textContent = pullState.paused
-          ? `Paused ${pullState.fetched}/${pullState.total}`
-          : `Pulling ${pullState.fetched}/${pullState.total}…`;
+// Minimized pill: the quiet home of every background run — show it
+        // while the panel is tucked away and a pull or loadouts burst is in
+        // flight, and keep it up afterwards while a burst's completion
+        // summary is pending (cleared when the panel is restored).
+        const pill = overlayEl.querySelector("#stl-overlay-pill");
+        if (pill) {
+          const pillStatus = pill.querySelector(".stl-pill-status");
+          const lo = overlayState.loadouts;
+          const visible =
+            (pullState.running || lo.running || (overlayState.loadoutsAck && lo.captured > 0))
+            && overlayState.minimized;
+          pill.classList.toggle("stl-pill-visible", visible);
+          if (visible) applyOverlayPillPosition(pill);
+          if (visible && pillStatus) {
+            if (pullState.running) {
+              pillStatus.textContent = pullState.paused
+                ? `Paused ${pullState.fetched}/${pullState.total}`
+                : `Pulling ${pullState.fetched}/${pullState.total}…`;
+            } else if (lo.running) {
+              pillStatus.textContent = lo.total > 0
+                ? `⚙ Fetching loadouts ${lo.done}/${lo.total}…`
+                : `⚙ Fetching loadouts… ${lo.done} requested`;
+            } else {
+              pillStatus.textContent = `⚙ ${lo.captured} trial loadouts fetched`;
+            }
       }
     }
 
@@ -3615,7 +4898,9 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
               .map((a) => `<span class="stl-ab" title="${escapeHtml(a.hrid)}">${escapeHtml(abilityTail(a.hrid))} <b>${a.level}</b></span>`)
               .join("")}</span>`
           : "–";
-        return `<tr class="${missing ? "stl-row-missing" : ""}">
+        // v1.37.0: data-stl-cid ties the row to its member so the gear
+        // tooltip can resolve the row's profile even after re-renders.
+        return `<tr class="${missing ? "stl-row-missing" : ""}" data-stl-cid="${m.characterId}">
           <td class="stl-col-name">${escapeHtml(m.characterName)}</td>
           ${cells}
           <td class="stl-col-abilities">${abilitiesCell}</td>
@@ -3657,6 +4942,235 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
   }
 
+  // ---------------------------------------------------------------------
+  // v1.37.0: gear hover tooltip for the roster overlay.
+  //
+  // Hover a member's name to see their equipment the way the combat
+  // simulator shows a character's gear: every loadout (its name, the
+  // skill it's used for, a "default" tag, and a "this week's …" tag for
+  // the loadout the member signed up with on a trial), with the item
+  // names (+ enhancement) per slot under each.
+  //
+  // Sources:
+  //   - pulledProfilesFull[cid].loadouts — each pulled member's FULL
+  //     loadout set (profile_shared carries characterLoadoutMap, same
+  //     shape our own init snapshot uses);
+  //   - ensureItemNameMap() — the game's itemDetailMap, for names;
+  //   - trialsSnapshot.signups[cid] — this week's signups, to tag which
+  //     loadout actually ran the trials.
+  // When the member's profile wasn't pulled yet, hovering fires a single
+  // on-demand view_profile request (the same one "Pull members" uses) and
+  // the tooltip upgrades to the real gear as soon as the game answers.
+  // ---------------------------------------------------------------------
+  let gearTipEl = null; // tooltip node (lazy)
+  let gearTipCid = null; // member id the tooltip is showing (null = hidden)
+  let gearTipTimer = null; // hover-dwell timer
+  let gearTipXY = null; // last known cursor position [x, y] — the tip shows at it
+  const gearFetchInFlight = new Set(); // member ids with a fetch running
+
+  function hasMemberGear(cid) {
+    const prof =
+      pulledProfilesFull[cid] || pulledProfilesFull[String(cid)] || null;
+    return !!(prof && Array.isArray(prof.loadouts) && prof.loadouts.length > 0);
+  }
+
+  function ensureGearTipEl() {
+    if (gearTipEl) return gearTipEl;
+    const tip = document.createElement("div");
+    tip.id = "stl-gear-tip";
+    (overlayEl || document.body).appendChild(tip);
+    // The tip is readable on hover: entering it cancels a pending hide.
+    tip.addEventListener("mouseenter", () => {
+      if (gearTipTimer) { clearTimeout(gearTipTimer); gearTipTimer = null; }
+    });
+    tip.addEventListener("mouseleave", () => scheduleHideGearTip(120));
+    gearTipEl = tip;
+    return tip;
+  }
+
+  // "/equipment_locations/robe_top" -> "Robe Top"; plain labels pass
+  // through untouched.
+  function gearLabel(hrid) {
+    const s = String(hrid || "").trim();
+    if (!s) return "";
+    const tail = s.split("/").pop() || s;
+    if (!s.includes("/") && !tail.includes("_")) return s;
+    const parts = tail.split("_").filter(Boolean);
+    if (parts.length === 0) return tail;
+    return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
+  }
+
+  // Loadouts this member committed to this week's trials, keyed by
+  // numeric loadoutId -> "<kind>: <trial>" e.g. "combat: Dragon Slayer".
+  function weekTrialLoadoutTags(cid) {
+    const tags = {};
+    const s = trialsSnapshot.signups[cid] || trialsSnapshot.signups[String(cid)] || null;
+    if (!s) return tags;
+    for (const kind of ["skilling", "combat"]) {
+      const sub = s[kind];
+      if (!sub || sub.loadoutId === null || sub.loadoutId === undefined) continue;
+      const n = Number(sub.loadoutId);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      const trial = String(sub.trialHrid || "")
+        .split("/").pop().replace(/_/g, " ").trim();
+      tags[n] = kind + (trial ? ": " + trial : "");
+    }
+    return tags;
+  }
+
+  // Tooltip body for one member. `state`: undefined = normal data view,
+  // "fetching" = an on-demand pull is in flight, "none" = nothing fetched.
+  function buildGearTipHtml(member, state) {
+    const cid = member.characterId;
+    let html = `<div class="stl-gt-name">${escapeHtml(member.characterName)} <span class="stl-gt-id">(#${cid})</span></div>`;
+    if (state === "fetching") {
+      html += `<div class="stl-gt-note">Fetching gear from the game…</div>`;
+      return html;
+    }
+    const prof =
+      pulledProfilesFull[cid] || pulledProfilesFull[String(cid)] || null;
+    if (!prof || !Array.isArray(prof.loadouts) || prof.loadouts.length === 0) {
+      // profile_shared carries hideWearableItems: when a member opts out of
+      // gear sharing the wearableItemMap is empty/absent by design, so say
+      // so instead of implying a capture failure.
+      const hidden = !!(prof && prof.raw && prof.raw.hideWearableItems === true);
+      html += hidden
+        ? `<div class="stl-gt-note">This member has hidden their gear from other players.</div>`
+        : `<div class="stl-gt-note">No gear captured yet — use "Pull members" to fetch the roster's loadouts.</div>`;
+      return html;
+    }
+    const names = ensureItemNameMap();
+    const tags = weekTrialLoadoutTags(cid);
+    // Trial-used loadouts first, then the default, then the rest.
+    const rank = (lo) => {
+      const n = Number(lo.loadoutId) || 0;
+      if (tags[n]) return 0;
+      if (lo.isDefault) return 1;
+      return 2;
+    };
+    const loadouts = prof.loadouts.slice().sort((a, b) => rank(a) - rank(b));
+    for (const lo of loadouts) {
+      const n = Number(lo.loadoutId) || 0;
+      let rows = "";
+      for (const eq of lo.equipment || []) {
+        if (!eq || !eq.itemHrid) continue;
+        const d = names[eq.itemHrid];
+        const name = (d && typeof d.name === "string" && d.name)
+          || String(eq.itemHrid).split("/").pop().replace(/_/g, " ");
+        const enh = typeof eq.enhancementLevel === "number" && eq.enhancementLevel > 0
+          ? `<span class="stl-gt-enh">+${eq.enhancementLevel}</span>`
+          : "";
+        rows += `<div class="stl-gt-row">` +
+          `<span class="stl-gt-slot">${escapeHtml(gearLabel(eq.slot) || "Item")}</span>` +
+          `<span class="stl-gt-item">${escapeHtml(name)}${enh}</span></div>`;
+      }
+      const tagsHtml =
+        (lo.isDefault ? `<span class="stl-gt-tag">default</span>` : "") +
+        (tags[n] ? `<span class="stl-gt-tag trial">${escapeHtml("this week's " + tags[n])}</span>` : "");
+      const sub = lo.actionTypeHrid ? `<span class="stl-gt-lo-skill">${escapeHtml(gearLabel(lo.actionTypeHrid))}</span>` : "";
+      html += `<div class="stl-gt-loadout">` +
+        `<div class="stl-gt-lo-head">` +
+        `<span class="stl-gt-lo-name">${escapeHtml(lo.name || ("Loadout #" + (n || "?")))}</span>` +
+        sub + tagsHtml +
+        `</div>${rows}</div>`;
+    }
+    if (loadouts.length > 12) {
+      html += `<div class="stl-gt-note">…${loadouts.length - 12} more loadout(s)</div>`;
+      // (all loadouts still list above — the note is a length cue only)
+    }
+    return html;
+  }
+
+  // Render/refresh the open tooltip for gearTipCid. Re-resolves the anchor
+  // cell from the live DOM so table re-renders (search filter, pull
+  // progress) can't strand the tip on a detached node; the tip itself sits
+  // at the user's cursor (see positionGearTip), like the History page's
+  // menu, not pinned to the cell edge.
+  function refreshGearTip() {
+    if (gearTipCid === null) return;
+    if (!overlayEl || !overlayEl.classList.contains("stl-overlay-open")) {
+      hideGearTip();
+      return;
+    }
+    const member = guildMembers.find((g) => g && g.characterId === gearTipCid);
+    if (!member) {
+      hideGearTip();
+      return;
+    }
+    const tip = ensureGearTipEl();
+    const state = hasMemberGear(gearTipCid)
+      ? undefined
+      : (gearFetchInFlight.has(gearTipCid) ? "fetching" : "none");
+    tip.innerHTML = buildGearTipHtml(member, state);
+    const anchor = overlayEl.querySelector(`tr[data-stl-cid="${gearTipCid}"] > td.stl-col-name`);
+    if (!anchor) {
+      hideGearTip();
+      return;
+    }
+    tip.style.display = "block";
+    positionGearTip(anchor);
+  }
+
+  // Places the tip just past the user's CURSOR (like the History page's
+  // menu): right of it +16px, below it +12px, flipped to the other side
+  // when it would overflow the viewport. `anchorEl` is only a fallback
+  // position source (its center) for refreshes that happen without a
+  // captured cursor sample (e.g. a profile fetch settling after the mouse
+  // left the table).
+  function positionGearTip(anchorEl) {
+    const tip = gearTipEl;
+    if (!tip) return;
+    const rect = tip.getBoundingClientRect();
+    let cx = null, cy = null;
+    if (gearTipXY) { cx = gearTipXY[0]; cy = gearTipXY[1]; }
+    else if (anchorEl) {
+      const r = anchorEl.getBoundingClientRect();
+      cx = r.left + r.width / 2;
+      cy = r.top + r.height / 2;
+    }
+    if (cx === null) return;
+    let x = cx + 16;
+    let y = cy + 12;
+    if (x + rect.width > window.innerWidth - 8) x = Math.max(8, cx - rect.width - 16);
+    if (y + rect.height > window.innerHeight - 8) y = Math.max(8, cy - rect.height - 12);
+    tip.style.left = `${x}px`;
+    tip.style.top = `${y}px`;
+  }
+
+  function showGearTip(cid) {
+    gearTipCid = Number(cid);
+    refreshGearTip();
+  }
+
+  function hideGearTip() {
+    gearTipCid = null;
+    gearTipXY = null;
+    if (gearTipTimer) { clearTimeout(gearTipTimer); gearTipTimer = null; }
+    if (gearTipEl) gearTipEl.style.display = "none";
+  }
+
+  function scheduleHideGearTip(delay) {
+    if (gearTipTimer) { clearTimeout(gearTipTimer); gearTipTimer = null; }
+    gearTipTimer = setTimeout(hideGearTip, delay);
+  }
+
+  // One-shot gear fetch for a hovered member (same view_profile request as
+  // "Pull members"). Skipped while a full pull runs (data is already
+  // arriving) and deduped per member.
+  function requestGearFetch(cid) {
+    if (pullState.running) return;
+    if (gearFetchInFlight.has(cid)) return;
+    if (hasMemberGear(cid)) return;
+    if (!socketReady()) return;
+    const member = guildMembers.find((g) => g && g.characterId === cid);
+    if (!member) return;
+    gearFetchInFlight.add(cid);
+    requestMemberProfile(member).then(() => {
+      gearFetchInFlight.delete(cid);
+      if (gearTipCid === cid) refreshGearTip();
+    });
+  }
+
   function buildOverlay() {
     if (overlayBuilt || overlayEl) return overlayEl;
     overlayBuilt = true;
@@ -3678,6 +5192,22 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       <button id="stl-ov-pull" type="button" title="Pull every guild member's live skill levels and equipped abilities">Pull members</button>
       <button id="stl-ov-pause" type="button" title="Pause/Resume the pull" disabled>Pause</button>
       <button id="stl-ov-push" type="button" title="Push the pulled roster to the ledger">Push to ledger</button>
+      <!-- v1.37.0: trial-loadout capture lives in the roster toolbar (its
+           "multi-use area" for everyone-in-the-guild actions) — the ONLY
+           thing that asks the game for members' signed-up trial loadouts
+           (one view_loadout per second; the full roster takes a few
+           minutes). Cached results attach to the next snapshot push and
+           show on the site's History page. v1.37.x: the run is quiet —
+           pressing this tucks the panel into the floating pill and the
+           burst runs in the background, locking only its own button. -->
+      <button id="stl-ov-loadouts" type="button" title="Fetch the signed-up trial loadouts of every guild member from the game (online or offline — one request per second, the full roster takes a few minutes). Runs quietly in the background: this panel tucks into the floating pill, which shows progress and the result.">&#9881; Trial Loadouts</button>
+      <!-- v1.37.0: manual mid-week snapshot push — direct and guild-
+           gated, the same way the roster's "Push to ledger" works (no
+           site-side "Snapshot now" request). Runs the week's snapshot
+           (stats + signups + any loadouts fetched by the button above)
+           right now; auto-pushes still happen at the weekly rollover
+           and once both trials complete. -->
+      <button id="stl-ov-push-snapshot" type="button" title="Push THIS week's trial snapshot (stats + signups + any fetched loadouts) to the site right now, like the roster push above. Guild members only — the ledger verifies your membership. Auto-pushes still happen at the weekly rollover and once both trials are completed.">&#9889; Push Snapshot</button>
       <span id="stl-overlay-progress"></span>
       <input id="stl-ov-search" type="text" placeholder="Filter members…" />
     `;
@@ -3790,15 +5320,17 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     const currentApiBase = () => cfgGet().apiBase.replace(/\/$/, "");
 
     overlay.querySelector("#stl-overlay-close").addEventListener("click", () => {
-      if (pullState.running) {
+      if (pullState.running || loadoutBurstRunning || overlayState.loadoutsAck) {
         // Keep the overlay present so the progress pill stays visible, but
-        // hide the panel — equivalent to minimizing while a pull is in flight.
+        // hide the panel — equivalent to minimizing while a pull or the
+        // loadouts burst is in flight (or its summary is still pending).
         overlayState.minimized = true;
         overlay.classList.add("stl-overlay-minimized");
       } else {
         overlayState.minimized = false;
         overlay.classList.remove("stl-overlay-minimized");
         overlay.classList.remove("stl-overlay-open");
+        hideGearTip();
       }
       renderOverlay();
     });
@@ -3810,6 +5342,8 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     overlay.querySelector("#stl-pill-restore").addEventListener("click", () => {
       overlayState.minimized = false;
       overlay.classList.remove("stl-overlay-minimized");
+      // The burst summary leaves the pill for the panel footer below.
+      overlayState.loadoutsAck = false;
       renderOverlay();
     });
     overlay.querySelector("#stl-ov-search").addEventListener("input", renderOverlay);
@@ -3860,6 +5394,152 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       }
       setOverlayButtons(false);
       overlayFooter(result, /failed|error|Nothing to push|blocked/i.test(result) ? "err" : "ok");
+    });
+
+    // v1.37.0: on-demand trial-loadout capture, home-swapped from the main
+    // panel into the roster toolbar (the "multi-use area" for
+    // everyone-in-the-guild actions). This is the ONLY trigger for
+    // view_loadout bursts (no auto-sweeps; pushes never gap-fill).
+    // v1.37.x: the run is quiet — pressing this tucks the roster panel
+    // into the floating progress pill (the game stays in front), the
+    // burst locks ONLY its own button (Pull / Push to ledger / Push
+    // Snapshot remain usable; a concurrent pull's unlock can't re-enable
+    // it mid-flight), and progress/summary surface in the pill:
+    // "⚙ Fetching loadouts x/y…" then "⚙ N trial loadouts fetched",
+    // which lingers until the panel is reopened (footer mirrors it).
+    // The cached loadouts ride along on the next snapshot push — the
+    // toolbar's "⚡ Push Snapshot" button (or the rollover / completion
+    // auto-pushes) ships them to the site.
+    overlay.querySelector("#stl-ov-loadouts").addEventListener("click", async () => {
+      const btn = overlay.querySelector("#stl-ov-loadouts");
+      if (!socketReady()) {
+        overlayFooter("The game's socket isn't connected yet — rejoin the game, then press this again.", "err");
+        return;
+      }
+      // v1.37.x quiet background run: lock only this button (Pull / Push to
+      // ledger / Push Snapshot stay usable), tuck the panel into its
+      // floating pill so the game stays in front, and report progress in
+      // the pill (and the footer, if the panel is restored meanwhile).
+      btn.disabled = true;
+      overlayState.loadouts = { running: true, done: 0, total: 0, captured: 0 };
+      overlayState.loadoutsAck = false;
+      overlayFooter("Fetching trial loadouts… (one member per second; a full roster takes a few minutes)", "");
+      overlayState.minimized = true;
+      overlay.classList.add("stl-overlay-minimized");
+      renderOverlay();
+      try {
+        const captured = await fetchWeekTrialLoadouts((done, total) => {
+          overlayState.loadouts.done = done;
+          overlayState.loadouts.total = total;
+          overlayFooter(`Fetching trial loadouts… ${done}/${total} requested`, "");
+          renderOverlay(); // keeps the pill's progress line fresh
+        });
+        const stored = Object.keys(trialsSnapshot.trialLoadouts).length;
+        overlayState.loadouts.running = false;
+        overlayState.loadouts.captured = captured;
+        if (captured > 0) {
+          // Linger in the pill with a summary so the background run's
+          // completion is visible without the big panel.
+          overlayState.loadoutsAck = true;
+          renderOverlay();
+          overlayFooter(`Fetched ${captured} trial loadout${captured === 1 ? "" : "s"} — ${stored} stored this week; they ship with the next snapshot push.`, "ok");
+        } else if (stored > 0) {
+          overlayFooter(`Nothing new to fetch — all ${stored} of this week's loadouts are already stored.`, "ok");
+        } else {
+          overlayFooter("No trial loadouts fetched — nobody appears signed up for a trial yet, or the game hasn't shared the guild's trial data yet.", "err");
+        }
+      } catch (err) {
+        overlayState.loadouts.running = false;
+        overlayFooter(`Trial-loadout fetch failed — ${err && err.message ? err.message : String(err)}`, "err");
+      } finally {
+        // The burst itself cleared loadoutBurstRunning; a pull may have run
+        // meanwhile and left the toolbar locked — never steal that unlock.
+        if (!pullState.running) btn.disabled = false;
+        renderOverlay();
+      }
+    });
+
+    // v1.37.0: manual mid-week snapshot push — the site's "Snapshot now"
+    // request round-trip is gone, so this button is the manual path: a
+    // DIRECT, guild-gated POST, exactly like this toolbar's roster
+    // "Push to ledger" (pushGuildGate gives early local feedback; the
+    // ledger's own membership check is authoritative server-side).
+    // force:true skips the local "already pushed this week" guard, so
+    // pressing it again (e.g. after a loadouts fetch) refreshes the rows
+    // via upsert.
+    overlay.querySelector("#stl-ov-push-snapshot").addEventListener("click", async () => {
+      const btn = overlay.querySelector("#stl-ov-push-snapshot");
+      const apiBase = currentApiBase();
+      if (!apiBase) {
+        overlayFooter("Set the API base URL in Settings first.", "err");
+        return;
+      }
+      if (!trialsSnapshot.weekKey) {
+        overlayFooter("No week captured yet — open the in-game Guild panel once so the guild's trial data lands.", "err");
+        return;
+      }
+      const gate = pushGuildGate();
+      if (gate) {
+        overlayFooter(gate, "err");
+        return;
+      }
+      setOverlayButtons(true);
+      overlayFooter(`Pushing this week's snapshot (${trialsSnapshot.weekKey}) to the ledger…`, "");
+      let message = null;
+      try {
+        message = await pushTrialSnapshot(trialsSnapshot.weekKey, { apiBase, reason: "roster overlay button", force: true });
+      } catch (err) {
+        message = `Snapshot push failed — ${err && err.message ? err.message : String(err)}`;
+      } finally {
+        setOverlayButtons(false);
+      }
+      if (!message) message = "Nothing pushed (a push was already in flight, or no data captured).";
+      overlayFooter(message, /failed/i.test(message) ? "err" : "ok");
+    });
+
+    // v1.37.0: gear tooltip — enter a member's name cell after a short
+    // dwell (so a sweep across the table doesn't strobe tooltips);
+    // leaving (except into the tooltip itself) hides it again. The tip
+    // opens at the user's cursor (like the History page's menu) and keeps
+    // following it while the cursor moves over name cells.
+    bodyEl.addEventListener("mouseover", (event) => {
+      const target = event.target;
+      if (!target || typeof target.closest !== "function") return;
+      const cell = target.closest("td.stl-col-name");
+      if (!cell) return;
+      const row = cell.closest("tr");
+      const cid = row ? Number(row.getAttribute("data-stl-cid")) : NaN;
+      if (!Number.isFinite(cid) || cid <= 0) return;
+      gearTipXY = [event.clientX, event.clientY];
+      if (gearTipTimer) { clearTimeout(gearTipTimer); gearTipTimer = null; }
+      gearTipTimer = setTimeout(() => {
+        gearTipTimer = null;
+        showGearTip(cid);
+        requestGearFetch(cid);
+      }, 140);
+    });
+    // Track the pointer while it is over name cells so the tip opens exactly
+    // where the cursor is (even mid-dwell); once open it also follows the
+    // cursor. Moving it onto the tooltip itself (target = the tip, not a
+    // name cell) leaves the tip exactly where it is, so it can be read or
+    // scrolled without jumping under the cursor.
+    bodyEl.addEventListener("mousemove", (event) => {
+      const target = event.target;
+      if (!target || typeof target.closest !== "function") return;
+      const cell = target.closest("td.stl-col-name");
+      if (!cell) return;
+      gearTipXY = [event.clientX, event.clientY];
+      if (gearTipCid !== null && gearTipEl && gearTipEl.style.display !== "none") {
+        positionGearTip(cell);
+      }
+    });
+    bodyEl.addEventListener("mouseout", (event) => {
+      const target = event.target;
+      if (!target || typeof target.closest !== "function") return;
+      if (!target.closest("td.stl-col-name")) return;
+      const to = event.relatedTarget;
+      if (to && gearTipEl && gearTipEl.contains(to)) return; // moved into the tip
+      scheduleHideGearTip(120);
     });
 
     renderOverlay();
@@ -4034,6 +5714,12 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         <div id="stl-actions">
           <button id="stl-send" type="button">Sync Character</button>
           <button id="stl-roster" type="button" title="Pull / push the guild roster (cull lives on the website, admin only)">\uD83D\uDC65 Guild Roster</button>
+        <!-- v1.37.0: the whole "guild-wide" action set moved into the
+             guild roster overlay's toolbar (see buildOverlay) — its
+             multi-use area: the "⚙ Trial Loadouts" burst button AND the
+             manual mid-week "⚡ Push Snapshot" button (direct,
+             guild-gated, no site-side "Snapshot now" request). The panel
+             keeps only Sync Character + Guild Roster. -->
         </div>
         <!-- v1.36.0: always-visible dropdown holding the per-skill results
              of "Sync Character" (rendered by renderSyncResults) so the
@@ -4432,8 +6118,8 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       // warning (it strips everything the tracker does in this page).
       const who = characterName ? `${characterName} (ID ${characterId})` : `ID ${characterId}`;
       const message = enable
-        ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's optimizer pick.`
-        : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the optimizer-pick / sit-out highlight and update button all go away. You can turn it back on anytime from Settings → Trial Tracker.`;
+        ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's recommended trial.`
+        : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the recommended-trial / sit-out highlight and update button all go away. You can turn it back on anytime from Settings → Trial Tracker.`;
       if (!window.confirm(message)) {
         enabledToggle.checked = !enable; // cancel: put the switch back
         return;
@@ -4575,6 +6261,12 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       // for the next sweep.
       applyTrialHighlight();
     });
+
+    // v1.37.0: both guild-wide actions moved to the roster overlay
+    // toolbar — the "⚙ Trial Loadouts" button + handler and the manual
+    // "⚡ Push Snapshot" button + handler now live in buildOverlay()
+    // (the roster is the panel's multi-use area for everyone-in-the-
+    // guild actions). The panel keeps Sync Character / Guild Roster.
 
     return panel;
   }
@@ -5369,8 +7061,8 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         // warning (it strips everything the tracker does in this page).
         const who = characterName ? `${characterName} (ID ${characterId})` : `ID ${characterId}`;
         const message = enable
-          ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's optimizer pick.`
-          : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the optimizer-pick / sit-out highlight and update button all go away. You can turn it back on anytime from this tab.`;
+          ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's recommended trial.`
+          : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the recommended-trial / sit-out highlight and update button all go away. You can turn it back on anytime from this tab.`;
         if (!window.confirm(message)) {
           tEnabled.checked = !enable; // cancel: put the switch back
           return;
