@@ -345,6 +345,17 @@
     return { characterId: id, characterName: name };
   }
 
+  // Paint the read-only character ID/name fields of a settings surface
+  // (popup: "stl-", in-game Settings tab: "stlt-") from the freshest known
+  // resolution (live detection first). Both surfaces share this paint.
+  function paintIdentityFields(surface, prefix) {
+    const resolved = resolveCharacter();
+    const idInput = surface.querySelector(`#${prefix}characterId`);
+    const nameInput = surface.querySelector(`#${prefix}characterName`);
+    if (idInput) idInput.value = resolved.characterId == null ? "" : resolved.characterId;
+    if (nameInput) nameInput.value = resolved.characterName == null ? "" : resolved.characterName;
+  }
+
   // ---------------------------------------------------------------------
   // v1.37.0 — Per-character master switch.
   //
@@ -1504,8 +1515,8 @@
   }
 
   // Install both hooks at document-start, before the game connects.
-  const dataHookOk = patchPageWebSocket();
-  const ctorHookOk = patchPageWebSocketConstructor();
+  patchPageWebSocket();
+  patchPageWebSocketConstructor();
 
   // ---------------------------------------------------------------------
   // Toolasha adoption: if the Toolasha userscript is also active it
@@ -1548,8 +1559,7 @@
   function pollForToolashaData(maxMs, intervalMs) {
     const deadline = Date.now() + maxMs;
     (function tick() {
-      if (adoptToolashaData()) return;
-      if (Date.now() >= deadline) return;
+      if (adoptToolashaData() || Date.now() >= deadline) return;
       setTimeout(tick, intervalMs);
     })();
   }
@@ -1801,8 +1811,7 @@
   // (see the note on planState above) can be surfaced instead of looking
   // identical to "no plan yet".
   async function refreshLatestPlan(apiBase) {
-    if (planFetchInFlight) return;
-    if (!apiBase) return;
+    if (planFetchInFlight || !apiBase) return;
     planFetchInFlight = true;
     planFetchStartedAt = Date.now();
     try {
@@ -1931,8 +1940,7 @@
   // reminder UI. Never throws: a transport failure or missing field just
   // means "no reminder" (we only nag when we have a real newer version).
   async function checkForUpdate(apiBase) {
-    if (updateFetchInFlight) return;
-    if (!apiBase) return;
+    if (updateFetchInFlight || !apiBase) return;
     updateFetchInFlight = true;
     try {
       const res = await gmRequest("GET", `${apiBase}/api/config`);
@@ -2396,6 +2404,10 @@
     return order;
   }
 
+  // Last path segment of a hrid, lowercased ("/guild_combat/badger" ->
+  // "badger") — the match token shared by the panel-order code below.
+  const tailOf = (s) => String(s).split("/").pop().toLowerCase();
+
   // True when the panel names and the game hrids cover exactly the same set
   // of trials (hrid tail vs normalized panel name) — i.e. the on-screen panel
   // shows THIS week's trials. Guards the self-correction against a stale panel
@@ -2403,7 +2415,6 @@
   function panelOrderMatches(hrids, panelNames) {
     if (!Array.isArray(hrids) || hrids.length === 0) return false;
     if (!Array.isArray(panelNames) || panelNames.length === 0) return false;
-    const tailOf = (s) => String(s).split("/").pop().toLowerCase();
     const hridTails = {};
     for (const h of hrids) hridTails[tailOf(h)] = true;
     const nameToks = {};
@@ -2436,29 +2447,22 @@
       // builder), so use the top-level config accessor — the overlay-scoped
       // currentApiBase const is NOT visible here.
       const apiBase = cfgGet().apiBase.replace(/\/$/, "");
-      if (skillingTrialHrids && skillingTrialHrids.length > 0
-        && panelTrialOrder.skilling.length > 0
-        && panelOrderMatches(skillingTrialHrids, panelTrialOrder.skilling)) {
-        const ordered = reorderHridsToPanelOrder(skillingTrialHrids, panelTrialOrder.skilling);
-        if (ordered.length > 0 && !hridArraysEqual(ordered, lastSkillingPush)) {
-          const res = await gmRequest("POST", `${apiBase}/api/skilling-trials`, { skillHrids: ordered });
-          if (res.status === 200) {
-            lastSkillingPush = ordered;
-            skillingTrialsSent = true;
-          }
-        }
-      }
-      if (combatTrialHrids && combatTrialHrids.length > 0
-        && panelTrialOrder.combat.length > 0
-        && panelOrderMatches(combatTrialHrids, panelTrialOrder.combat)) {
-        const ordered = reorderHridsToPanelOrder(combatTrialHrids, panelTrialOrder.combat);
-        if (ordered.length > 0 && !hridArraysEqual(ordered, lastCombatPush)) {
-          const res = await gmRequest("POST", `${apiBase}/api/combat-trials`, { combatHrids: ordered });
-          if (res.status === 200) {
-            lastCombatPush = ordered;
-            combatTrialsSent = true;
-          }
-        }
+      // One loop over both kinds — the two blocks were otherwise identical
+      // with the kind's variables swapped (skilling first: it is the one
+      // whose currentTrialsData fallback usually arms the push).
+      for (const kind of ["skilling", "combat"]) {
+        const raw = kind === "skilling" ? skillingTrialHrids : combatTrialHrids;
+        if (!raw || raw.length === 0 || panelTrialOrder[kind].length === 0
+          || !panelOrderMatches(raw, panelTrialOrder[kind])) continue;
+        const ordered = reorderHridsToPanelOrder(raw, panelTrialOrder[kind]);
+        const last = kind === "skilling" ? lastSkillingPush : lastCombatPush;
+        if (ordered.length === 0 || hridArraysEqual(ordered, last)) continue;
+        const field = kind === "skilling" ? "skillHrids" : "combatHrids";
+        const path = kind === "skilling" ? `${apiBase}/api/skilling-trials` : `${apiBase}/api/combat-trials`;
+        const res = await gmRequest("POST", path, { [field]: ordered });
+        if (res.status !== 200) continue;
+        if (kind === "skilling") { lastSkillingPush = ordered; skillingTrialsSent = true; }
+        else { lastCombatPush = ordered; combatTrialsSent = true; }
       }
     } catch (e) { /* best-effort — never throw from a sweep/observer path */ }
   }
@@ -2484,7 +2488,6 @@
   function reorderHridsToPanelOrder(hrids, panelNames) {
     if (!Array.isArray(hrids) || hrids.length === 0) return hrids;
     if (!Array.isArray(panelNames) || panelNames.length === 0) return hrids;
-    const tailOf = (s) => String(s).split("/").pop().toLowerCase();
     const hridByToken = {};
     for (const h of hrids) hridByToken[tailOf(h)] = h;
     const out = [];
@@ -2555,8 +2558,7 @@
             break;
           }
         }
-        if (!relevant) return;
-        if (!document.querySelector(TRIALS_TAB_MARKER)) return;
+        if (!relevant || !document.querySelector(TRIALS_TAB_MARKER)) return;
         const panel = findTrialPanel();
         if (panel !== trialPanelTarget) {
           // Mounted (or the container element swapped): attach + catch up
@@ -3097,27 +3099,16 @@
     return (d && typeof d === "object") ? d : null;
   }
 
-  // Order this week's SKILLING trial hrids exactly like the game's
-  // Guild → Trials panel, using the game's own sortTrialHrids() logic against
-  // the captured static table (see captureGuildTrialDetails). No panel/UI
-  // interaction is involved. Returns an array of hrids in panel order, or
-  // null when the table is missing or none of the hrids are in it (in which
-  // case the caller tries the other confirmation sources and, if none
-  // confirms the order, holds the push).
-  function orderSkillingHrids(hrids) {
-    if (!guildTrialDetailMap || !Array.isArray(hrids) || hrids.length === 0) return null;
-    const idx = (h) => { const d = trialDetailFor(h); return (d && d.sortIndex != null) ? Number(d.sortIndex) : 0; };
-    const ordered = hrids.slice().sort((a, b) => idx(a) - idx(b));
-    // Confirm the table actually carried these hrids (a stable sort would
-    // "succeed" as a no-op otherwise); if not, report null → unconfirmed.
-    let any = false;
-    for (const h of hrids) { if (trialDetailFor(h)) { any = true; break; } }
-    if (!any) return null;
-    return ordered;
-  }
-
-  // Same, for this week's COMBAT trial hrids.
-  function orderCombatHrids(hrids) {
+  // Order this week's trial hrids exactly like the game's Guild → Trials
+  // panel, using the game's own sortTrialHrids() logic against the captured
+  // static table (see captureGuildTrialDetails). The sort is kind-agnostic,
+  // so the same function serves both the skilling and the combat arrays. No
+  // panel/UI interaction is involved. Returns an array of hrids in panel
+  // order, or null when the table is missing or none of the hrids are in it
+  // (a stable sort would "succeed" as a no-op otherwise) — in which case
+  // the caller tries the other confirmation sources and, if none confirms
+  // the order, holds the push.
+  function orderTrialHrids(hrids) {
     if (!guildTrialDetailMap || !Array.isArray(hrids) || hrids.length === 0) return null;
     const idx = (h) => { const d = trialDetailFor(h); return (d && d.sortIndex != null) ? Number(d.sortIndex) : 0; };
     const ordered = hrids.slice().sort((a, b) => idx(a) - idx(b));
@@ -3254,8 +3245,7 @@
   // WS: guild_trial_stats_updated. The game's own handler stores the list
   // only when e.guildId matches the joined guild; we mirror that guard.
   function captureSnapshotStats(msg) {
-    if (!msg || typeof msg !== "object") return;
-    if (!Array.isArray(msg.guildTrialStatList)) return;
+    if (!msg || typeof msg !== "object" || !Array.isArray(msg.guildTrialStatList)) return;
     if (msg.guildId != null && detectedGuildId != null) {
       const gid = Number(msg.guildId);
       if (Number.isInteger(gid) && gid !== detectedGuildId) return; // another guild's traffic
@@ -4008,39 +3998,59 @@
     }
   }
 
-  // Push this week's combat-trial hrids to the ledger (one-time per page
-  // load) so the Combat Dashboard can name the two teams after the monsters.
-  // Pushes ONLY when the panel order is CONFIRMED through a data channel (no
-  // panel/UI interaction at all): (1) the game's static guild-trial table
-  // (guildTrialDetailMap, see captureGuildTrialDetails) — the exact sort the
-  // game applies to the Guild → Trials panel; (2) a Guild → Trials DOM read
-  // (readTrialPanelOrder / panelTrialOrder) when that tab happens to be the
-  // active sub-panel and its tiles show exactly this week's trials.
-  // Otherwise the push is HELD (skip note returned, combatTrialsSent stays
-  // false) so the raw combatHrids order is never stored — a later sync or
-  // panel read re-pushes once the order is confirmed.
-  // Best-effort: a failure never blocks the rest of a sync/pull.
-  async function pushCombatTrials(apiBase) {
-    if (combatTrialsSent || !combatTrialHrids || combatTrialHrids.length === 0) return null;
-    const fromTable = orderCombatHrids(combatTrialHrids); // from the static table — no UI
-    const panelNames = panelTrialOrder && panelTrialOrder.combat; // cached DOM order (if any)
-    const fromPanel = (fromTable == null && panelNames
-      && panelOrderMatches(combatTrialHrids, panelNames))
-      ? reorderHridsToPanelOrder(combatTrialHrids, panelNames)
+  // One shared driver for the week's trial-hrid pushes (combat + skilling).
+  // A push goes out ONLY when the panel order is CONFIRMED through a data
+  // channel — no panel/UI interaction:
+  //   1. the game's static guild-trial table (guildTrialDetailMap — see
+  //      captureGuildTrialDetails), the exact table the game sorts the
+  //      Guild → Trials panel by;
+  //   2. a Guild → Trials DOM read (panelTrialOrder) when that tab is the
+  //      active sub-panel and its tiles show exactly this week's trials;
+  //   3. (skilling only) the game's own currentTrialsData payload — the
+  //      skilling.parties key order (skillingPanelOrderHrids).
+  // If none confirms it, the push is HELD (skip note returned, the sent
+  // flag stays false) so the raw order is never stored — a later sync,
+  // panel read, or rollover re-pushes once it is confirmed. A failure never
+  // blocks the rest of a sync/pull.
+  async function pushTrialHrids(spec) {
+    if (spec.isSent() || !spec.raw || spec.raw.length === 0) return null;
+    const fromTable = spec.orderFromTable(spec.raw); // from the static table — no UI
+    const panelNames = panelTrialOrder ? panelTrialOrder[spec.kind] : null; // cached DOM order (if any)
+    const fromPanel = (fromTable == null && Array.isArray(panelNames) && panelNames.length > 0
+      && panelOrderMatches(spec.raw, panelNames))
+      ? reorderHridsToPanelOrder(spec.raw, panelNames)
       : null;
-    const confirmed = (fromTable && fromTable.length > 0)
-      ? fromTable
-      : (fromPanel && fromPanel.length > 0 ? fromPanel : null);
-    if (!confirmed) {
-      return "Combat trials: held (order not confirmed yet — will push once it is known).";
+    const fromData = (fromTable == null && fromPanel == null && spec.orderFromData)
+      ? spec.orderFromData()
+      : null;
+    let confirmed = null;
+    for (const candidate of [fromTable, fromPanel, fromData]) {
+      if (candidate && candidate.length > 0) { confirmed = candidate; break; }
     }
-    const res = await gmRequest("POST", `${apiBase}/api/combat-trials`, { combatHrids: confirmed });
+    if (!confirmed) return spec.heldNote;
+    const res = await gmRequest("POST", spec.apiBase + spec.endpoint, spec.payload(confirmed));
     if (res.status === 200) {
-      combatTrialsSent = true;
-      lastCombatPush = confirmed; // seed the panel-order self-correction baseline
-      return `Pushed this week's combat trials (${confirmed.length}) to the ledger.`;
+      spec.markSent(confirmed);
+      return `Pushed this week's ${spec.label} trials (${confirmed.length}) to the ledger.`;
     }
-    return `Combat-trial push failed (${res.status}): ${res.responseText}`;
+    return `${spec.failLabel} push failed (${res.status}): ${res.responseText}`;
+  }
+
+  // Push this week's combat-trial hrids so the Combat Dashboard can name the
+  // two teams after the monsters. Only the static table + DOM read confirm
+  // combat order (no currentTrialsData for combat). One-time per page load.
+  async function pushCombatTrials(apiBase) {
+    return pushTrialHrids({
+      apiBase, kind: "combat", raw: combatTrialHrids,
+      isSent: () => combatTrialsSent,
+      // markSent seeds the panel-order self-correction baseline
+      markSent: (h) => { combatTrialsSent = true; lastCombatPush = h; },
+      orderFromTable: (h) => orderTrialHrids(h),
+      endpoint: "/api/combat-trials",
+      payload: (h) => ({ combatHrids: h }),
+      label: "combat", failLabel: "Combat-trial",
+      heldNote: "Combat trials: held (order not confirmed yet — will push once it is known)."
+    });
   }
 
   // Capture this week's skilling-trial skills from a guild message. The game
@@ -4085,7 +4095,6 @@
     try { parsed = JSON.parse(skillingCurrentTrialsData); } catch (e) { return null; }
     const parties = parsed && parsed.skilling && parsed.skilling.parties;
     if (!parties || typeof parties !== "object") return null;
-    const tailOf = (s) => String(s).split("/").pop().toLowerCase();
     const partyTails = {};
     for (const key of Object.keys(parties)) partyTails[tailOf(key)] = true;
     // Confirmation gate: this week's trials must all be covered by the
@@ -4105,50 +4114,24 @@
     return panelOrder.length === skillingTrialHrids.length ? panelOrder : null;
   }
 
-  // Push this week's skilling-trial hrids to the ledger (one-time per page
-  // load) so the Skilling Dashboard auto-selects this week's trial skills in
-  // the in-game panel order. The raw guildWeeklyTrialSet.skillHrids array is
-  // NOT the panel order (the game sorts it by a static per-trial sortIndex),
-  // so we reorder using (in priority order, NO panel/UI interaction involved):
-  //   1. the game's static guild-trial table (guildTrialDetailMap — see
-  //      captureGuildTrialDetails), the exact table the game itself sorts by;
-  //   2. a Guild → Trials DOM read (readTrialPanelOrder / panelTrialOrder)
-  //      when that tab is the active sub-panel and its tiles show exactly
-  //      this week's trials;
-  //   3. the currentTrialsData path (skillingPanelOrderHrids) — the game's
-  //      own trial-set payload (captured from guild messages).
-  // If NONE of those confirms the order, the push is HELD (skip note
-  // returned, skillingTrialsSent stays false) so the raw skillHrids order is
-  // never stored — a later sync or panel read re-pushes once it is confirmed.
-  // A failure never blocks the rest of a sync/pull.
+  // Push this week's skilling-trial hrids so the Skilling Dashboard
+  // auto-selects this week's skills in the in-game panel order. The raw
+  // guildWeeklyTrialSet.skillHrids array is NOT the panel order (the game
+  // sorts it by a static per-trial sortIndex), and unlike combat the
+  // currentTrialsData payload is also a valid confirmation source (orderFromData).
   async function pushSkillingTrials(apiBase) {
-    if (skillingTrialsSent || !skillingTrialHrids || skillingTrialHrids.length === 0) return null;
-    const fromTable = orderSkillingHrids(skillingTrialHrids); // from the static table — no UI
-    const panelSkilling = panelTrialOrder && panelTrialOrder.skilling; // cached DOM order (if any)
-    const fromPanel = (fromTable == null && Array.isArray(panelSkilling) && panelSkilling.length > 0
-      && panelOrderMatches(skillingTrialHrids, panelSkilling))
-      ? reorderHridsToPanelOrder(skillingTrialHrids, panelSkilling)
-      : null;
-    const fromData = (fromTable == null && fromPanel == null)
-      ? skillingPanelOrderHrids()
-      : null;
-    const confirmed = (fromTable && fromTable.length > 0)
-      ? fromTable
-      : ((fromPanel && fromPanel.length > 0)
-          ? fromPanel
-          : ((fromData && fromData.length > 0)
-              ? fromData
-              : null));
-    if (!confirmed) {
-      return "Skilling trials: held (order not confirmed yet — will push once it is known).";
-    }
-    const res = await gmRequest("POST", `${apiBase}/api/skilling-trials`, { skillHrids: confirmed });
-    if (res.status === 200) {
-      skillingTrialsSent = true;
-      lastSkillingPush = confirmed; // seed the panel-order self-correction baseline
-      return `Pushed this week's skilling trials (${confirmed.length}) to the ledger.`;
-    }
-    return `Skilling-trial push failed (${res.status}): ${res.responseText}`;
+    return pushTrialHrids({
+      apiBase, kind: "skilling", raw: skillingTrialHrids,
+      isSent: () => skillingTrialsSent,
+      // markSent seeds the panel-order self-correction baseline
+      markSent: (h) => { skillingTrialsSent = true; lastSkillingPush = h; },
+      orderFromTable: (h) => orderTrialHrids(h),
+      orderFromData: () => skillingPanelOrderHrids(),
+      endpoint: "/api/skilling-trials",
+      payload: (h) => ({ skillHrids: h }),
+      label: "skilling", failLabel: "Skilling-trial",
+      heldNote: "Skilling trials: held (order not confirmed yet — will push once it is known)."
+    });
   }
 
   // Push all full trial profiles to the ledger via POST /api/member-profiles/sync.
@@ -4241,13 +4224,10 @@
   }
 
   async function maybeAutoSync() {
-    if (trackerDisabled()) return; // v1.37.0: off for this character
-    if (!cfgGet().autoSyncEnabled) return;
+    if (trackerDisabled() || !cfgGet().autoSyncEnabled) return; // v1.37.0: off for this character, or auto-sync disabled
     if (detectedCharacterId === null) return; // no identity captured yet
     const apiBase = cfgGet().apiBase.replace(/\/$/, "");
-    if (!apiBase) return;
-    if (autoSyncInFlight) return;
-    if (!autoSyncDue()) return;
+    if (!apiBase || autoSyncInFlight || !autoSyncDue()) return;
     // v1.27.0: honor "push regardless of guild" (async — reads the ledger's
     // live-guild snapshot). A block is NOT a completed run, so it must not
     // set the 30-min cooldown: the next trigger retries. The status line is
@@ -4437,37 +4417,6 @@
       display: block; margin: 10px 0 4px; color: #b7b9cc; font-size: 11px;
       text-transform: uppercase; letter-spacing: 0.04em; font-family: system-ui, sans-serif;
     }
-    #stl-settings-tab-panel input:not([type=checkbox]) {
-      width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 5px;
-      border: 1px solid rgba(255,255,255,0.15); background: #101117; color: #fff;
-      font-size: 13px; font-family: system-ui, sans-serif;
-    }
-    #stl-settings-tab-panel label.stl-check {
-      display: flex; align-items: center; gap: 6px; margin-top: 10px;
-      text-transform: none; letter-spacing: 0; font-size: 12px; color: #f3f3f7;
-      cursor: pointer; font-family: system-ui, sans-serif;
-    }
-    #stl-settings-tab-panel label.stl-check input { width: auto; margin: 0; }
-    #stlt-characterId, #stlt-characterName {
-      background: #17181f; color: #e8eaf3; border-color: rgba(255,255,255,0.08);
-      pointer-events: none; user-select: none;
-    }
-    #stlt-characterId { -moz-appearance: textfield; appearance: textfield; }
-    #stlt-characterId::-webkit-outer-spin-button,
-    #stlt-characterId::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-    #stl-settings-tab-panel .stlt-save { display: flex; gap: 8px; margin-top: 12px; }
-    #stl-settings-tab-panel .stlt-save button {
-      flex: 1; padding: 7px 0; border-radius: 6px; border: none; cursor: pointer;
-      font: 600 12px system-ui, sans-serif;
-    }
-    #stlt-save { background: #333; color: #fff; }
-    #stlt-reset { background: #7a2d24; color: #fff; }
-    #stlt-status { margin-top: 10px; font-size: 11px; color: #b7b9cc; white-space: pre-line; font-family: system-ui, sans-serif; }
-    #stlt-status.err { color: #e2564a; }
-    #stlt-status.ok { color: #35c25a; }
-    #stlt-autosync-status { margin-top: 4px; font-size: 11px; color: #b7b9cc; font-family: system-ui, sans-serif; }
-    #stlt-autosync-status.ok { color: #35c25a; }
-    #stlt-autosync-status.err { color: #e2564a; }
     /* v1.37.0: the per-character "tracker is OFF" state — an amber note
        above the re-enable control in the in-game Settings tab (the one UI
        the switch can never remove: it is the escape hatch back on). */
@@ -4519,15 +4468,20 @@
     }
     #stl-nav button.active { background: #a86a0c; border-color: #a86a0c; color: #fff; }
     #stl-panel label { display: block; margin: 8px 0 3px; color: #b7b9cc; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
-    #stl-panel input:not([type=checkbox]) {
+    /* Shared with the in-game Settings tab's #stlt- inputs/labels (the
+       tab's copy sits in the game's own DOM, whose default font is not
+       system-ui — so font-family is stated explicitly; on #stl-panel it is
+       already the inherited value, i.e. a no-op there). */
+    #stl-panel input:not([type=checkbox]), #stl-settings-tab-panel input:not([type=checkbox]) {
       width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 5px;
       border: 1px solid rgba(255,255,255,0.15); background: #101117; color: #fff; font-size: 13px;
+      font-family: system-ui, sans-serif;
     }
-    #stl-panel label.stl-check {
+    #stl-panel label.stl-check, #stl-settings-tab-panel label.stl-check {
       display: flex; align-items: center; gap: 6px; margin-top: 10px;
       text-transform: none; letter-spacing: 0; font-size: 12px; color: #f3f3f7; cursor: pointer;
     }
-    #stl-panel label.stl-check input { width: auto; margin: 0; }
+    #stl-panel label.stl-check input, #stl-settings-tab-panel label.stl-check input { width: auto; margin: 0; }
     #stl-skill-row { display: flex; align-items: center; justify-content: space-between; margin: 4px 0; gap: 8px; }
     #stl-skill-row label { margin: 0; flex: 1; text-transform: none; letter-spacing: 0; color: #f3f3f7; font-size: 12px; }
     /* Fixed width for every level box: just enough for 3 digits, with a few
@@ -4554,23 +4508,25 @@
        identity, so they get the same dimmed "locked" box look as the level
        values — reference info, not editable fields (no caret on click).
        The ID box is a number input, so strip its spin buttons too. */
-    #stl-characterId, #stl-characterName {
+    #stl-characterId, #stlt-characterId, #stl-characterName, #stlt-characterName {
       background: #17181f; color: #e8eaf3; border-color: rgba(255,255,255,0.08);
       pointer-events: none; user-select: none;
     }
-    #stl-characterId { -moz-appearance: textfield; appearance: textfield; }
+    #stl-characterId, #stlt-characterId { -moz-appearance: textfield; appearance: textfield; }
     #stl-characterId::-webkit-outer-spin-button,
-    #stl-characterId::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-    #stl-actions { display: flex; gap: 8px; margin-top: 12px; }
-    #stl-actions button {
+    #stlt-characterId::-webkit-outer-spin-button,
+    #stl-characterId::-webkit-inner-spin-button,
+    #stlt-characterId::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    #stl-actions, #stl-settings-tab-panel .stlt-save { display: flex; gap: 8px; margin-top: 12px; }
+    #stl-actions button, #stl-settings-tab-panel .stlt-save button {
       flex: 1; padding: 7px 0; border-radius: 6px; border: none; cursor: pointer; font: 600 12px system-ui, sans-serif;
     }
     #stl-send { background: #a86a0c; color: #fff; }
-    #stl-save { background: #333; color: #fff; }
-    #stl-reset { background: #7a2d24; color: #fff; }
-    #stl-status { margin-top: 10px; font-size: 11px; color: #b7b9cc; white-space: pre-line; }
-    #stl-status.err { color: #e2564a; }
-    #stl-status.ok { color: #35c25a; }
+    #stl-save, #stlt-save { background: #333; color: #fff; }
+    #stl-reset, #stlt-reset { background: #7a2d24; color: #fff; }
+    #stl-status, #stlt-status { margin-top: 10px; font-size: 11px; color: #b7b9cc; white-space: pre-line; }
+    #stl-status.err, #stlt-status.err { color: #e2564a; }
+    #stl-status.ok, #stlt-status.ok { color: #35c25a; }
     /* v1.36.0: the per-skill result list from "Sync Character" renders in
        this always-visible dropdown instead of the status line, so a long
        dump can never make the panel suddenly grow. The summary row is a
@@ -4925,21 +4881,23 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   }
 
   function escapeHtml(str) {
-    return String(str)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
+    return String(str).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[c]
+    );
   }
 
   // v1.35.1: "/abilities/pestilent_shot" -> "Pestilent Shot" for the
   // roster overlay's Abilities column (same convention as the site).
-  function abilityTail(hrid) {
-    const tail = String(hrid).split("/").pop() || "";
-    const parts = tail.split("_").filter(Boolean);
-    if (parts.length === 0) return tail;
+  // Title-case an underscored hrid tail ("pestilent_shot" -> "Pestilent
+  // Shot") — shared by the roster Abilities column and the gear tooltip.
+  function titleizeHridTail(tail) {
+    const parts = String(tail).split("_").filter(Boolean);
+    if (parts.length === 0) return String(tail);
     return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
+  }
+
+  function abilityTail(hrid) {
+    return titleizeHridTail(String(hrid).split("/").pop() || "");
   }
 
   // ---------------------------------------------------------------------
@@ -4995,9 +4953,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     if (!s) return "";
     const tail = s.split("/").pop() || s;
     if (!s.includes("/") && !tail.includes("_")) return s;
-    const parts = tail.split("_").filter(Boolean);
-    if (parts.length === 0) return tail;
-    return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
+    return titleizeHridTail(tail);
   }
 
   // Loadouts this member committed to this week's trials, keyed by
@@ -5158,10 +5114,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   // "Pull members"). Skipped while a full pull runs (data is already
   // arriving) and deduped per member.
   function requestGearFetch(cid) {
-    if (pullState.running) return;
-    if (gearFetchInFlight.has(cid)) return;
-    if (hasMemberGear(cid)) return;
-    if (!socketReady()) return;
+    if (pullState.running || gearFetchInFlight.has(cid) || hasMemberGear(cid) || !socketReady()) return;
     const member = guildMembers.find((g) => g && g.characterId === cid);
     if (!member) return;
     gearFetchInFlight.add(cid);
@@ -5243,77 +5196,17 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     document.body.appendChild(overlay);
     overlayEl = overlay;
 
-    let pillDrag = null;
-    pill.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || event.target.closest("button")) return;
-      const rect = pill.getBoundingClientRect();
-      pillDrag = {
-        pointerId: event.pointerId,
-        offsetX: event.clientX - rect.left,
-        offsetY: event.clientY - rect.top,
-        left: rect.left,
-        top: rect.top
-      };
-      pill.setPointerCapture(event.pointerId);
+    wireDrag(pill, pill, {
+      skipTarget: "button",
+      onEnd: (d) => cfgSet({ overlayPillPosition: { left: d.left, top: d.top } })
     });
-    pill.addEventListener("pointermove", (event) => {
-      if (!pillDrag || event.pointerId !== pillDrag.pointerId) return;
-      const maxLeft = Math.max(0, window.innerWidth - pill.offsetWidth);
-      const maxTop = Math.max(0, window.innerHeight - pill.offsetHeight);
-      const left = Math.min(Math.max(0, event.clientX - pillDrag.offsetX), maxLeft);
-      const top = Math.min(Math.max(0, event.clientY - pillDrag.offsetY), maxTop);
-      pillDrag.left = left;
-      pillDrag.top = top;
-      pill.style.left = `${left}px`;
-      pill.style.top = `${top}px`;
-      pill.style.right = "auto";
-      pill.style.bottom = "auto";
-    });
-    const finishPillDrag = (event) => {
-      if (!pillDrag || event.pointerId !== pillDrag.pointerId) return;
-      if (pill.hasPointerCapture(event.pointerId)) pill.releasePointerCapture(event.pointerId);
-      cfgSet({ overlayPillPosition: { left: pillDrag.left, top: pillDrag.top } });
-      pillDrag = null;
-    };
-    pill.addEventListener("pointerup", finishPillDrag);
-    pill.addEventListener("pointercancel", finishPillDrag);
     applyOverlayPillPosition(pill);
 
-    let overlayDrag = null;
-    header.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || event.target.closest("button")) return;
-      const rect = panel.getBoundingClientRect();
-      overlayDrag = {
-        pointerId: event.pointerId,
-        offsetX: event.clientX - rect.left,
-        offsetY: event.clientY - rect.top,
-        left: rect.left,
-        top: rect.top
-      };
-      header.setPointerCapture(event.pointerId);
+    wireDrag(header, panel, {
+      skipTarget: "button",
+      clearTransform: true,
+      onEnd: (d) => cfgSet({ overlayPosition: { left: d.left, top: d.top } })
     });
-    header.addEventListener("pointermove", (event) => {
-      if (!overlayDrag || event.pointerId !== overlayDrag.pointerId) return;
-      const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
-      const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
-      const left = Math.min(Math.max(0, event.clientX - overlayDrag.offsetX), maxLeft);
-      const top = Math.min(Math.max(0, event.clientY - overlayDrag.offsetY), maxTop);
-      overlayDrag.left = left;
-      overlayDrag.top = top;
-      panel.style.left = `${left}px`;
-      panel.style.top = `${top}px`;
-      panel.style.transform = "none";
-      panel.style.right = "auto";
-      panel.style.bottom = "auto";
-    });
-    const finishOverlayDrag = (event) => {
-      if (!overlayDrag || event.pointerId !== overlayDrag.pointerId) return;
-      if (header.hasPointerCapture(event.pointerId)) header.releasePointerCapture(event.pointerId);
-      cfgSet({ overlayPosition: { left: overlayDrag.left, top: overlayDrag.top } });
-      overlayDrag = null;
-    };
-    header.addEventListener("pointerup", finishOverlayDrag);
-    header.addEventListener("pointercancel", finishOverlayDrag);
 
     // Read the API base fresh on each action so settings saved in the
     // panel (or Tampermonkey menu) apply without rebuilding the overlay.
@@ -5672,6 +5565,122 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     }
   }
 
+  const RESET_CONFIRM = "Reset to default?\n\nThis clears everything the Trial Tracker stored in this browser (API base, character ID/name, button/panel positions, saved levels, auto-sync state) — like a fresh install. Your ledger data on the website is NOT touched.";
+
+  // The Settings controls duplicated in two places (the popup's Settings
+  // view: #stl-* ids, the in-game Settings tab: #stlt-* ids) — API base,
+  // auto-sync, show/lock button, lock panel, reset, and the per-character
+  // enable switch. Both write the SAME stored config, so each change
+  // mirrors the other surface's inputs and either place can edit without
+  // the other going stale. Per-surface differences (where status is
+  // written, repainting its own rows, extra reset bookkeeping, the
+  // re-enable hint, the master-switch success line) are supplied via opts.
+  function wireSettingsControls(root, ids, opts) {
+    const q = (key) => root.querySelector(ids[key]);
+    const set = (text, kind) => opts.setStatus(text, kind);
+    const rep = () => opts.repaint && opts.repaint();
+    const mirror = (key, value) => {
+      const id = opts.mirrorIds && opts.mirrorIds[key];
+      if (!id) return;
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (el.type === "checkbox") el.checked = value;
+      else el.value = value;
+    };
+
+    q("save").addEventListener("click", () => {
+      // Character ID/name are auto-detected — saving persists the API base.
+      const apiEl = q("apiBase");
+      const apiBase = apiEl ? (apiEl.value || "").trim().replace(/\/$/, "") : "";
+      cfgSet({ apiBase });
+      set("Settings saved.", "ok");
+      if (opts.mirrorApiBase) opts.mirrorApiBase(apiBase);
+    });
+
+    q("autosync").addEventListener("change", (event) => {
+      cfgSet({ autoSyncEnabled: event.target.checked });
+      if (event.target.checked) maybeAutoSync(); // re-arm now if it was due
+      mirror("autosync", event.target.checked);
+    });
+
+    q("showFab").addEventListener("change", (event) => {
+      const show = event.target.checked;
+      cfgSet({ hideUpdateFab: !show });
+      if (show) {
+        if (document.body) ensureFab(); // hidden→shown needs the FAB re-added
+        set("Trial Tracker button shown.", "ok");
+      } else {
+        removeFab();
+        set("Trial Tracker button hidden. It stays hidden on reload until you show it again.", "ok");
+      }
+      mirror("showFab", show);
+      if (opts.repaintToggles) rep();
+    });
+
+    q("fabLock").addEventListener("change", (event) => {
+      const willLock = event.target.checked;
+      cfgSet({ fabLocked: willLock });
+      if (willLock) {
+        // Keep the saved position: locking re-pins the button where it is.
+        applyFabPosition();
+        set(cfgGet().fabPosition
+          ? "Trial Tracker button locked in place at its current position."
+          : "Trial Tracker button locked in place (bottom-right).", "ok");
+      } else {
+        set("Trial Tracker button unlocked — drag it anywhere you like.", "ok");
+      }
+      mirror("fabLock", willLock);
+      if (opts.repaintToggles) rep();
+    });
+
+    q("panelLock").addEventListener("change", (event) => {
+      const willLock = event.target.checked;
+      cfgSet({ panelLocked: willLock });
+      if (willLock) {
+        set(cfgGet().panelPosition
+          ? "Panel locked in place at its current position."
+          : "Panel locked in place (bottom-right).", "ok");
+      } else {
+        set("Panel unlocked — drag it by its title bar.", "ok");
+      }
+      mirror("panelLock", willLock);
+      if (opts.repaintToggles) rep();
+    });
+
+    q("enabled").addEventListener("change", (event) => {
+      const el = q("enabled");
+      const { characterId, characterName } = resolveCharacter();
+      if (!Number.isInteger(characterId) || characterId <= 0) {
+        set("No character ID detected yet — log in to the game first, then toggle this.", "err");
+        rep();
+        return;
+      }
+      const enable = event.target.checked;
+      // Confirm before flipping the master switch — off carries a warning
+      // (it strips everything the tracker does in this page).
+      const who = characterName ? `${characterName} (ID ${characterId})` : `ID ${characterId}`;
+      const message = enable
+        ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's recommended trial.`
+        : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the recommended-trial / sit-out highlight and update button all go away. You can turn it back on anytime from ${opts.reEnableHint}.`;
+      if (!window.confirm(message)) {
+        el.checked = !enable; // cancel: put the switch back
+        return;
+      }
+      setCharacterDisabled(characterId, !enable);
+      const msg = opts.enabledStatus({ enable, isOn: !trackerDisabled() });
+      if (msg) set(msg, "ok");
+      mirror("enabled", enable);
+    });
+
+    q("reset").addEventListener("click", () => {
+      // The nuclear option (see resetToDefaults) — confirm first.
+      if (!window.confirm(RESET_CONFIRM)) return;
+      const count = resetToDefaults();
+      if (opts.afterReset) opts.afterReset();
+      set(`Reset to default \u2014 cleared ${count} stored values. Fresh-install state.`, "ok");
+    });
+  }
+
   function buildPanel() {
     const cfg = cfgGet();
 
@@ -5798,42 +5807,12 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       event.stopPropagation();
       panel.classList.remove("open");
     });
-    let panelDrag = null;
-    panelHeader.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || event.target.closest("#stl-panel-close")) return;
-      if (cfgGet().panelLocked !== false) return; // locked: ignore title drags
-      const rect = panel.getBoundingClientRect();
-      panelDrag = {
-        pointerId: event.pointerId,
-        offsetX: event.clientX - rect.left,
-        offsetY: event.clientY - rect.top,
-        left: rect.left,
-        top: rect.top
-      };
-      panelHeader.setPointerCapture(event.pointerId);
+    wireDrag(panelHeader, panel, {
+      skipTarget: "#stl-panel-close",
+      locked: () => cfgGet().panelLocked !== false,
+      clearTransform: true,
+      onEnd: (d) => cfgSet({ panelPosition: { left: d.left, top: d.top } })
     });
-    panelHeader.addEventListener("pointermove", (event) => {
-      if (!panelDrag || event.pointerId !== panelDrag.pointerId) return;
-      const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
-      const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
-      const left = Math.min(Math.max(0, event.clientX - panelDrag.offsetX), maxLeft);
-      const top = Math.min(Math.max(0, event.clientY - panelDrag.offsetY), maxTop);
-      panelDrag.left = left;
-      panelDrag.top = top;
-      panel.style.left = `${left}px`;
-      panel.style.top = `${top}px`;
-      panel.style.transform = "none";
-      panel.style.right = "auto";
-      panel.style.bottom = "auto";
-    });
-    const finishPanelDrag = (event) => {
-      if (!panelDrag || event.pointerId !== panelDrag.pointerId) return;
-      if (panelHeader.hasPointerCapture(event.pointerId)) panelHeader.releasePointerCapture(event.pointerId);
-      cfgSet({ panelPosition: { left: panelDrag.left, top: panelDrag.top } });
-      panelDrag = null;
-    };
-    panelHeader.addEventListener("pointerup", finishPanelDrag);
-    panelHeader.addEventListener("pointercancel", finishPanelDrag);
 
     const skillsContainer = panel.querySelector("#stl-skills");
     // Levels are read-only displays of the auto-detected values (they come
@@ -5977,31 +5956,11 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     renderUpdateReminder();
 
     // v1.36.0: the character ID/name fields are read-only (auto-detected
-    // from the game), so saving here only persists the API base URL.
-    panel.querySelector("#stl-save").addEventListener("click", () => {
-      const apiBase = panel.querySelector("#stl-apiBase").value.trim().replace(/\/$/, "");
-      cfgSet({ apiBase });
-      setStatus("Settings saved.", "ok");
-    });
-
-    // v1.26.0: per-player auto-sync opt-out (ON by default). Persist the
-    // preference immediately; the engine reads it fresh on every trigger.
-    panel.querySelector("#stl-autosync").addEventListener("change", (event) => {
-      cfgSet({ autoSyncEnabled: event.target.checked });
-      if (event.target.checked) maybeAutoSync(); // re-arm now if it was due
-      const t = document.getElementById("stlt-autosync"); // keep the tab in sync
-      if (t) t.checked = event.target.checked;
-    });
-
-    // v1.28.0: wipe all app storage → fresh-install state (see
-    // resetToDefaults). Confirm first — this is the nuclear option.
-    panel.querySelector("#stl-reset").addEventListener("click", () => {
-      if (!window.confirm(
-        "Reset to default?\n\nThis clears everything the Trial Tracker stored in this browser (API base, character ID/name, button/panel positions, saved levels, auto-sync state) — like a fresh install. Your ledger data on the website is NOT touched."
-      )) return;
-      const count = resetToDefaults();
-      setStatus(`Reset to default \u2014 cleared ${count} stored values. Fresh-install state.`, "ok");
-    });
+    // from the game) — saving only persists the API base. The duplicated
+    // settings controls (save, auto-sync, show/lock button, lock panel,
+    // reset, per-character enable) are wired below through the shared
+    // wireSettingsControls(), the same wiring the in-game Settings tab
+    // uses (v1.36.0 auto-sync, v1.28.0 reset, v1.37.0 master switch).
 
     // v1.36.0: Main/Settings view switcher. The two content divs replace
     // each other entirely (title + nav + status stay put); the active view
@@ -6028,11 +5987,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       panelLockToggle.checked = cfgGet().panelLocked !== false; // default: locked
       // The read-only identity fields live in this view — refresh them from
       // the freshest known resolution (live detection first) on entry.
-      const resolved = resolveCharacter();
-      const idInput = panel.querySelector("#stl-characterId");
-      const nameInput = panel.querySelector("#stl-characterName");
-      if (idInput) idInput.value = resolved.characterId == null ? "" : resolved.characterId;
-      if (nameInput) nameInput.value = resolved.characterName == null ? "" : resolved.characterName;
+      paintIdentityFields(panel, "stl-");
     }
     function showView(view) {
       activeView = view;
@@ -6081,93 +6036,37 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       new ResizeObserver(pinPanelToMainHeight).observe(viewMainContent);
     }
 
-    // v1.36.0: show/hide the floating button — the same setting the
-    // Tampermonkey menu command toggles, so it can now be changed here too.
-    // Hiding removes the FAB; showing re-adds it (if the panel is open the
-    // FAB still exists, so only the hidden→shown transition needs ensureFab).
-    showFabToggle.addEventListener("change", (event) => {
-      const show = event.target.checked;
-      cfgSet({ hideUpdateFab: !show });
-      if (show) {
-        if (document.body) ensureFab();
-        setStatus("Trial Tracker button shown.", "ok");
-      } else {
-        removeFab();
-        setStatus(
-          "Trial Tracker button hidden. It stays hidden on reload until you show it again.",
-          "ok"
-        );
+    // v1.36.0: show/hide the floating button (same setting as the
+    // Tampermonkey menu command); v1.37.0: the per-character master switch
+    // (mirrors the in-game Settings tab's #stlt-enabled; switching OFF
+    // strips everything in the page, so the confirm line is only seen on
+    // re-enable). All of the duplicated controls are wired through the
+    // shared wireSettingsControls() above.
+    wireSettingsControls(panel, {
+      save: "#stl-save",
+      apiBase: "#stl-apiBase",
+      autosync: "#stl-autosync",
+      reset: "#stl-reset",
+      showFab: "#stl-settings-show-fab",
+      fabLock: "#stl-settings-fab-lock",
+      panelLock: "#stl-settings-panel-lock",
+      enabled: "#stl-settings-enabled"
+    }, {
+      setStatus,
+      repaint: syncSettingsUi, // repaint the settings rows after a change
+      repaintToggles: true,
+      reEnableHint: "Settings → Trial Tracker",
+      // Switching off closes the panel — so only the re-enable gets a
+      // line of confirmation.
+      enabledStatus: ({ isOn }) => (isOn ? "Trial tracker enabled for this character." : null),
+      // Mirror changes into the in-game Settings tab's copies.
+      mirrorIds: {
+        autosync: "stlt-autosync",
+        showFab: "stlt-showfab",
+        fabLock: "stlt-fablock",
+        panelLock: "stlt-panellock",
+        enabled: "stlt-enabled"
       }
-      syncSettingsUi();
-    });
-
-    // v1.37.0: per-character master switch (mirrors the in-game Settings
-    // tab's #stlt-enabled). Switching OFF strips everything in the page —
-    // setCharacterDisabled → applyTrackerState closes this panel and
-    // removes the button — so a confirmation line is only ever seen on a
-    // re-enable (switching off leaves no panel to show it in).
-    enabledToggle.addEventListener("change", (event) => {
-      const { characterId, characterName } = resolveCharacter();
-      if (!Number.isInteger(characterId) || characterId <= 0) {
-        setStatus("No character ID detected yet — log in to the game first, then toggle this.", "err");
-        syncSettingsUi();
-        return;
-      }
-      const enable = event.target.checked;
-      // v1.37.0: confirm before flipping the master switch — off carries a
-      // warning (it strips everything the tracker does in this page).
-      const who = characterName ? `${characterName} (ID ${characterId})` : `ID ${characterId}`;
-      const message = enable
-        ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's recommended trial.`
-        : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the recommended-trial / sit-out highlight and update button all go away. You can turn it back on anytime from Settings → Trial Tracker.`;
-      if (!window.confirm(message)) {
-        enabledToggle.checked = !enable; // cancel: put the switch back
-        return;
-      }
-      setCharacterDisabled(characterId, !enable);
-      if (!trackerDisabled()) {
-        setStatus("Trial tracker enabled for this character.", "ok");
-      }
-      const t = document.getElementById("stlt-enabled"); // keep the tab in sync
-      if (t) t.checked = enable;
-    });
-
-    fabLockToggle.addEventListener("change", (event) => {
-      const willLock = event.target.checked;
-      cfgSet({ fabLocked: willLock });
-      if (willLock) {
-        // Keep the saved position (if any) and re-apply it: locking
-        // re-pins the button where it currently is rather than resetting.
-        applyFabPosition();
-        setStatus(
-          cfgGet().fabPosition
-            ? "Trial Tracker button locked in place at its current position."
-            : "Trial Tracker button locked in place (bottom-right).",
-          "ok"
-        );
-      } else {
-        setStatus("Trial Tracker button unlocked — drag it anywhere you like.", "ok");
-      }
-      syncSettingsUi();
-    });
-
-    // Lock/unlock the panel's title-bar drag. Like the FAB lock, unlocking
-    // leaves the panel where it is; re-locking re-pins it there (the saved
-    // panelPosition is what applyPanelPosition restores on open/rebuild).
-    panelLockToggle.addEventListener("change", (event) => {
-      const willLock = event.target.checked;
-      cfgSet({ panelLocked: willLock });
-      if (willLock) {
-        setStatus(
-          cfgGet().panelPosition
-            ? "Panel locked in place at its current position."
-            : "Panel locked in place (bottom-right).",
-          "ok"
-        );
-      } else {
-        setStatus("Panel unlocked — drag it by its title bar.", "ok");
-      }
-      syncSettingsUi();
     });
 
     syncSettingsUi();
@@ -6277,77 +6176,78 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   let fab = null;
   let onFabClick = null;
   let suppressFabClick = false;
-  let fabDrag = null;
   // v1.28.0: the panel lives at module scope (was a local in init()) so
   // resetToDefaults() can rebuild it — the onFabClick closure reads this
   // variable, so swapping `panel` swaps what the FAB opens.
   let panel = null;
 
-  function applyFabPosition() {
-    if (!fab) return;
-    const position = cfgGet().fabPosition;
-    if (!position || !Number.isFinite(position.left) || !Number.isFinite(position.top)) return;
-    const maxLeft = Math.max(0, window.innerWidth - fab.offsetWidth);
-    const maxTop = Math.max(0, window.innerHeight - fab.offsetHeight);
-    const left = Math.min(Math.max(0, position.left), maxLeft);
-    const top = Math.min(Math.max(0, position.top), maxTop);
-    fab.style.left = `${left}px`;
-    fab.style.top = `${top}px`;
-    fab.style.right = "auto";
-    fab.style.bottom = "auto";
+  // Shared drag wiring for the four draggable chrome pieces (fab, popup
+  // panel via h4, overlay panel via its header, overlay pill). All clamp to
+  // the viewport and clear right/bottom anchoring while dragging; the
+  // element's final position is handed to opts.onEnd. clearTransform resets
+  // a CSS bottom-right transform (panels only); trackMoved lets onEnd tell
+  // a real drag from a plain click (the fab).
+  function wireDrag(handleEl, targetEl, opts) {
+    let drag = null;
+    handleEl.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      if (opts.skipTarget && event.target.closest && event.target.closest(opts.skipTarget)) return;
+      if (opts.locked && opts.locked()) return; // locked: ignore drags
+      const rect = targetEl.getBoundingClientRect();
+      drag = {
+        pointerId: event.pointerId,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top,
+        left: rect.left,
+        top: rect.top,
+        moved: false
+      };
+      handleEl.setPointerCapture(event.pointerId);
+    });
+    handleEl.addEventListener("pointermove", (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      const maxLeft = Math.max(0, window.innerWidth - targetEl.offsetWidth);
+      const maxTop = Math.max(0, window.innerHeight - targetEl.offsetHeight);
+      const left = Math.min(Math.max(0, event.clientX - drag.offsetX), maxLeft);
+      const top = Math.min(Math.max(0, event.clientY - drag.offsetY), maxTop);
+      if (opts.trackMoved && (Math.abs(left - drag.left) > 2 || Math.abs(top - drag.top) > 2)) drag.moved = true;
+      drag.left = left;
+      drag.top = top;
+      targetEl.style.left = `${left}px`;
+      targetEl.style.top = `${top}px`;
+      if (opts.clearTransform) targetEl.style.transform = "none";
+      targetEl.style.right = "auto";
+      targetEl.style.bottom = "auto";
+    });
+    const finish = (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      if (handleEl.hasPointerCapture(event.pointerId)) handleEl.releasePointerCapture(event.pointerId);
+      if (opts.onEnd) opts.onEnd(drag);
+      drag = null;
+    };
+    handleEl.addEventListener("pointerup", finish);
+    handleEl.addEventListener("pointercancel", finish);
   }
 
-  function applyPanelPosition(panel) {
-    const position = cfgGet().panelPosition;
-    if (!position || !Number.isFinite(position.left) || !Number.isFinite(position.top)) return;
-    const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
-    const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
-    const left = Math.min(Math.max(0, position.left), maxLeft);
-    const top = Math.min(Math.max(0, position.top), maxTop);
-    panel.style.left = `${left}px`;
-    panel.style.top = `${top}px`;
-    panel.style.transform = "none";
-    panel.style.right = "auto";
-    panel.style.bottom = "auto";
+  // Restore a remembered element position, clamped to the current viewport.
+  function applyStoredPosition(el, position, clearTransform) {
+    if (!el || !position || !Number.isFinite(position.left) || !Number.isFinite(position.top)) return;
+    const left = Math.min(Math.max(0, position.left), Math.max(0, window.innerWidth - el.offsetWidth));
+    const top = Math.min(Math.max(0, position.top), Math.max(0, window.innerHeight - el.offsetHeight));
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    if (clearTransform) el.style.transform = "none";
+    el.style.right = "auto";
+    el.style.bottom = "auto";
   }
 
-  function applyOverlayPosition(panel) {
-    if (!panel) return;
-    const position = cfgGet().overlayPosition;
-    if (!position || !Number.isFinite(position.left) || !Number.isFinite(position.top)) return;
-    const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
-    const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
-    const left = Math.min(Math.max(0, position.left), maxLeft);
-    const top = Math.min(Math.max(0, position.top), maxTop);
-    panel.style.left = `${left}px`;
-    panel.style.top = `${top}px`;
-    panel.style.transform = "none";
-    panel.style.right = "auto";
-    panel.style.bottom = "auto";
-  }
+  function applyFabPosition() { applyStoredPosition(fab, cfgGet().fabPosition); }
 
-  function applyOverlayPillPosition(pill) {
-    const position = cfgGet().overlayPillPosition;
-    if (!position || !Number.isFinite(position.left) || !Number.isFinite(position.top)) return;
-    const maxLeft = Math.max(0, window.innerWidth - pill.offsetWidth);
-    const maxTop = Math.max(0, window.innerHeight - pill.offsetHeight);
-    const left = Math.min(Math.max(0, position.left), maxLeft);
-    const top = Math.min(Math.max(0, position.top), maxTop);
-    pill.style.left = `${left}px`;
-    pill.style.top = `${top}px`;
-    pill.style.right = "auto";
-    pill.style.bottom = "auto";
-  }
+  function applyPanelPosition(panel) { applyStoredPosition(panel, cfgGet().panelPosition, true); }
 
-  function finishFabDrag(event) {
-    if (!fabDrag || event.pointerId !== fabDrag.pointerId) return;
-    if (fab.hasPointerCapture(event.pointerId)) fab.releasePointerCapture(event.pointerId);
-    if (fabDrag.moved) {
-      cfgSet({ fabPosition: { left: fabDrag.left, top: fabDrag.top } });
-      suppressFabClick = true;
-    }
-    fabDrag = null;
-  }
+  function applyOverlayPosition(panel) { applyStoredPosition(panel, cfgGet().overlayPosition, true); }
+
+  function applyOverlayPillPosition(pill) { applyStoredPosition(pill, cfgGet().overlayPillPosition); }
 
   function ensureFab() {
     if (fab) return fab;
@@ -6357,36 +6257,15 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     fab.textContent = "\uD83D\uDCCA Trial Tracker";
     fab.title = "Click to open the ledger updater";
     fab.addEventListener("click", onFabClick);
-    fab.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
-      if (cfgGet().fabLocked !== false) return; // locked: ignore drags
-      const rect = fab.getBoundingClientRect();
-      fabDrag = {
-        pointerId: event.pointerId,
-        offsetX: event.clientX - rect.left,
-        offsetY: event.clientY - rect.top,
-        left: rect.left,
-        top: rect.top,
-        moved: false
-      };
-      fab.setPointerCapture(event.pointerId);
+    wireDrag(fab, fab, {
+      locked: () => cfgGet().fabLocked !== false,
+      trackMoved: true,
+      onEnd: (d) => {
+        if (!d.moved) return; // a plain click must not move the button
+        cfgSet({ fabPosition: { left: d.left, top: d.top } });
+        suppressFabClick = true;
+      }
     });
-    fab.addEventListener("pointermove", (event) => {
-      if (!fabDrag || event.pointerId !== fabDrag.pointerId) return;
-      const maxLeft = Math.max(0, window.innerWidth - fab.offsetWidth);
-      const maxTop = Math.max(0, window.innerHeight - fab.offsetHeight);
-      const left = Math.min(Math.max(0, event.clientX - fabDrag.offsetX), maxLeft);
-      const top = Math.min(Math.max(0, event.clientY - fabDrag.offsetY), maxTop);
-      if (Math.abs(left - fabDrag.left) > 2 || Math.abs(top - fabDrag.top) > 2) fabDrag.moved = true;
-      fabDrag.left = left;
-      fabDrag.top = top;
-      fab.style.left = `${left}px`;
-      fab.style.top = `${top}px`;
-      fab.style.right = "auto";
-      fab.style.bottom = "auto";
-    });
-    fab.addEventListener("pointerup", finishFabDrag);
-    fab.addEventListener("pointercancel", finishFabDrag);
     fab.addEventListener("click", (event) => {
       if (!suppressFabClick) return;
       suppressFabClick = false;
@@ -6857,51 +6736,55 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       // stored config as the panel's copy, so editing it in either place keeps
       // both in sync (see syncSettingsUi + refreshTabSettingsUi). Inputs use
       // distinct #stlt- ids so they never collide with the panel's.
-      stlPanel.innerHTML =
-        '<div class="stl-tab-heading">MWI Trial Tracker</div>' +
-        // Mirrors the popup's Settings view order: Save, API base URL,
-        // character ID, character name, per-character enable switch, then the
-        // auto-sync / button / lock / reset controls.
-        '<div id="stlt-controls-top">' +
-        '<div class="stlt-save"><button id="stlt-save" type="button">Save settings</button></div>' +
-        '<label>API base URL</label>' +
-        '<input id="stlt-apiBase" type="text" />' +
-        '</div>' +
-        // v1.36.0: character identity is auto-detected from the game and is
-        // read-only for reference. Kept OUTSIDE the hidden-when-off
-        // wrappers so the player can still see WHICH character is off.
-        '<label>Character ID</label>' +
-        '<input id="stlt-characterId" type="number" readonly />' +
-        '<label>Character name</label>' +
-        '<input id="stlt-characterName" type="text" readonly />' +
-        // v1.37.0: per-character master switch — ALWAYS visible, sitting
-        // right above the auto-sync toggle like the popup's copy. While this
-        // character is off, a note under the checkbox appears and the other
-        // controls (hidden together in #stlt-controls-top / #stlt-controls)
-        // stay hidden. The tab itself is never removed by the switch — it is
-        // the escape hatch that turns the tracker back on.
-        '<label class="stl-check" title="Turn the whole trial tracker on or off for THIS character only (keyed by its character ID — every other character in this browser keeps working as before).">' +
-        '<input id="stlt-enabled" type="checkbox" />' +
-        'Enable the trial tracker for this character</label>' +
-        '<div id="stlt-disabled-note"></div>' +
-        '<div id="stlt-controls">' +
-        '<label class="stl-check" title="Automatically push this character\'s levels and profile to the ledger when the game opens and every 30 minutes (a 30-minute cooldown prevents reload spam)">' +
-        '<input id="stlt-autosync" type="checkbox" />' +
-        'Auto-sync this character (on open + every 30 min)</label>' +
-        '<div id="stlt-autosync-status"></div>' +
-        '<label>Trial Tracker button</label>' +
-        '<label class="stl-check" title="Show or hide the floating Trial Tracker button (same setting as the Tampermonkey menu\'s \'hide/show Trial Tracker button\').">' +
-        '<input id="stlt-showfab" type="checkbox" />' +
-        'Show the Trial Tracker button</label>' +
-        '<label class="stl-check" title="Lock the Trial Tracker button in place. While unlocked you can drag it around; locking remembers its position.">' +
-        '<input id="stlt-fablock" type="checkbox" />' +
-        'Lock button position</label>' +
-        '<label class="stl-check" title="Lock the panel in place. While unlocked you can drag it by its title bar; locking remembers its position.">' +
-        '<input id="stlt-panellock" type="checkbox" />' +
-        'Lock panel position</label>' +
-        '<div class="stlt-save"><button id="stlt-reset" type="button" title="Clears everything this app stored in this browser (settings, positions, saved levels, auto-sync state) and starts from a fresh-install state">Reset to default</button></div>' +
-        '</div>' +
-        '<div id="stlt-status"></div>';
+      // Order mirrors the popup's Settings view: Save + API base (hidden
+      // while the character is off), character ID/name (always visible),
+      // the master switch, then the off-able auto-sync / button / lock /
+      // reset controls in #stlt-controls.
+      stlPanel.innerHTML = `
+        <div class="stl-tab-heading">MWI Trial Tracker</div>
+        <div id="stlt-controls-top">
+          <div class="stlt-save"><button id="stlt-save" type="button">Save settings</button></div>
+          <label>API base URL</label>
+          <input id="stlt-apiBase" type="text" />
+        </div>
+        <!-- v1.36.0: identity is auto-detected + read-only, and kept OUTSIDE
+             the hidden-when-off wrappers so the player still sees WHICH
+             character is off. -->
+        <label>Character ID</label>
+        <input id="stlt-characterId" type="number" readonly />
+        <label>Character name</label>
+        <input id="stlt-characterName" type="text" readonly />
+        <!-- v1.37.0: master switch — ALWAYS visible; while off, the note
+             appears and the other controls stay hidden. The tab itself is
+             never removed by the switch (the escape hatch back on). -->
+        <label class="stl-check" title="Turn the whole trial tracker on or off for THIS character only (keyed by its character ID — every other character in this browser keeps working as before).">
+          <input id="stlt-enabled" type="checkbox" />
+          Enable the trial tracker for this character
+        </label>
+        <div id="stlt-disabled-note"></div>
+        <div id="stlt-controls">
+          <label class="stl-check" title="Automatically push this character's levels and profile to the ledger when the game opens and every 30 minutes (a 30-minute cooldown prevents reload spam)">
+            <input id="stlt-autosync" type="checkbox" />
+            Auto-sync this character (on open + every 30 min)
+          </label>
+          <div id="stlt-autosync-status"></div>
+          <label>Trial Tracker button</label>
+          <label class="stl-check" title="Show or hide the floating Trial Tracker button (same setting as the Tampermonkey menu's 'hide/show Trial Tracker button').">
+            <input id="stlt-showfab" type="checkbox" />
+            Show the Trial Tracker button
+          </label>
+          <label class="stl-check" title="Lock the Trial Tracker button in place. While unlocked you can drag it around; locking remembers its position.">
+            <input id="stlt-fablock" type="checkbox" />
+            Lock button position
+          </label>
+          <label class="stl-check" title="Lock the panel in place. While unlocked you can drag it by its title bar; locking remembers its position.">
+            <input id="stlt-panellock" type="checkbox" />
+            Lock panel position
+          </label>
+          <div class="stlt-save"><button id="stlt-reset" type="button" title="Clears everything this app stored in this browser (settings, positions, saved levels, auto-sync state) and starts from a fresh-install state">Reset to default</button></div>
+        </div>
+        <div id="stlt-status"></div>
+      `;
       panelsHost.appendChild(stlPanel);
     } else if (stlPanel.parentElement !== panelsHost) {
       panelsHost.appendChild(stlPanel);
@@ -6952,10 +6835,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         tPanelLock.checked = cfg.panelLocked !== false; // default: locked
         tAuto.checked = cfg.autoSyncEnabled; // default: on
         const resolved = resolveCharacter();
-        const idInput = stlPanel.querySelector("#stlt-characterId");
-        const nameInput = stlPanel.querySelector("#stlt-characterName");
-        if (idInput) idInput.value = resolved.characterId == null ? "" : resolved.characterId;
-        if (nameInput) nameInput.value = resolved.characterName == null ? "" : resolved.characterName;
+        paintIdentityFields(stlPanel, "stlt-");
         // v1.37.0: the per-character master switch — the checkbox is always
         // visible (mirroring the popup's copy); while this character is off,
         // show the off note and hide the other controls — both hidden groups
@@ -6979,119 +6859,46 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         }
       };
 
-      stlPanel.querySelector("#stlt-save").addEventListener("click", () => {
-        const apiBase = (tApi && tApi.value.trim().replace(/\/$/, "")) || "";
-        cfgSet({ apiBase });
-        setTabStatus("Settings saved.", "ok");
-        // Keep the popup's Settings view in sync if it's currently open.
-        const pApi = document.getElementById("stl-apiBase");
-        if (pApi && pApi.value !== apiBase) pApi.value = apiBase;
-      });
-
-      tShowFab.addEventListener("change", (event) => {
-        const show = event.target.checked;
-        cfgSet({ hideUpdateFab: !show });
-        if (show) {
-          if (document.body) ensureFab();
-          setTabStatus("Trial Tracker button shown.", "ok");
-        } else {
-          removeFab();
-          setTabStatus("Trial Tracker button hidden. It stays hidden on reload until you show it again.", "ok");
-        }
-        const p = document.getElementById("stl-settings-show-fab");
-        if (p) p.checked = show;
-      });
-
-      tFabLock.addEventListener("change", (event) => {
-        const willLock = event.target.checked;
-        cfgSet({ fabLocked: willLock });
-        if (willLock) {
-          applyFabPosition();
-          setTabStatus(
-            cfgGet().fabPosition
-              ? "Trial Tracker button locked in place at its current position."
-              : "Trial Tracker button locked in place (bottom-right).",
-            "ok"
-          );
-        } else {
-          setTabStatus("Trial Tracker button unlocked — drag it anywhere you like.", "ok");
-        }
-        const p = document.getElementById("stl-settings-fab-lock");
-        if (p) p.checked = willLock;
-      });
-
-      tPanelLock.addEventListener("change", (event) => {
-        const willLock = event.target.checked;
-        cfgSet({ panelLocked: willLock });
-        if (willLock) {
-          setTabStatus(
-            cfgGet().panelPosition
-              ? "Panel locked in place at its current position."
-              : "Panel locked in place (bottom-right).",
-            "ok"
-          );
-        } else {
-          setTabStatus("Panel unlocked — drag it by its title bar.", "ok");
-        }
-        const p = document.getElementById("stl-settings-panel-lock");
-        if (p) p.checked = willLock;
-      });
-
-      tAuto.addEventListener("change", (event) => {
-        cfgSet({ autoSyncEnabled: event.target.checked });
-        if (event.target.checked) maybeAutoSync(); // re-arm now if it was due
-        const p = document.getElementById("stl-autosync");
-        if (p) p.checked = event.target.checked;
-      });
-
-      // v1.37.0: per-character master switch. It keys on the character ID
-      // the game reported for the logged-in character, so other characters
-      // in the same browser are unaffected. Enabling re-arms everything
-      // immediately (setCharacterDisabled → applyTrackerState → sweep +
-      // auto-sync + button) — no reload needed.
-      tEnabled.addEventListener("change", (event) => {
-        const { characterId, characterName } = resolveCharacter();
-        if (!Number.isInteger(characterId) || characterId <= 0) {
-          setTabStatus("No character ID detected yet — log in to the game first, then toggle this.", "err");
+      // v1.37.0: the per-character master switch (#stlt-enabled) keys on
+      // the character ID the game reported for the logged-in character, so
+      // other characters in the same browser are unaffected. Enabling
+      // re-arms everything immediately (setCharacterDisabled →
+      // applyTrackerState → sweep + auto-sync + button) — no reload needed.
+      wireSettingsControls(stlPanel, {
+        save: "#stlt-save",
+        apiBase: "#stlt-apiBase",
+        autosync: "#stlt-autosync",
+        reset: "#stlt-reset",
+        showFab: "#stlt-showfab",
+        fabLock: "#stlt-fablock",
+        panelLock: "#stlt-panellock",
+        enabled: "#stlt-enabled"
+      }, {
+        setStatus: setTabStatus,
+        repaint: refreshTabSettingsUi, // repaint the tab's rows after a change
+        reEnableHint: "this tab",
+        enabledStatus: ({ enable }) => (enable
+          ? "Trial tracker enabled for this character — button, auto-sync, and the trial highlight are back on."
+          : "Trial tracker switched off for this character. It does nothing until you enable it again from this tab."),
+        // Mirror the API base into the popup's Settings view if it's open.
+        mirrorApiBase: (apiBase) => {
+          const p = document.getElementById("stl-apiBase");
+          if (p && p.value !== apiBase) p.value = apiBase;
+        },
+        // Mirror changes into the popup's Settings view copies.
+        mirrorIds: {
+          autosync: "stl-autosync",
+          showFab: "stl-settings-show-fab",
+          fabLock: "stl-settings-fab-lock",
+          panelLock: "stl-settings-panel-lock",
+          enabled: "stl-settings-enabled"
+        },
+        afterReset: () => {
+          // The reset may have cleared THIS character's off state —
+          // repaint (incl. the identity fields) so the tab shows the
+          // correct (enabled) controls.
           refreshTabSettingsUi();
-          return;
         }
-        const enable = event.target.checked;
-        // v1.37.0: confirm before flipping the master switch — off carries a
-        // warning (it strips everything the tracker does in this page).
-        const who = characterName ? `${characterName} (ID ${characterId})` : `ID ${characterId}`;
-        const message = enable
-          ? `Turn the trial tracker back ON for ${who}?\n\nIt will resume capturing levels, pushing to the ledger, auto-syncing, and highlighting this character's recommended trial.`
-          : `Turn the trial tracker OFF for ${who}?\n\nWARNING: this disables EVERYTHING the trial tracker does for this character — it stops capturing levels, pushing to the ledger (auto and manual), auto-syncing, and the recommended-trial / sit-out highlight and update button all go away. You can turn it back on anytime from this tab.`;
-        if (!window.confirm(message)) {
-          tEnabled.checked = !enable; // cancel: put the switch back
-          return;
-        }
-        setCharacterDisabled(characterId, !enable);
-        setTabStatus(
-          enable
-            ? "Trial tracker enabled for this character — button, auto-sync, and the trial highlight are back on."
-            : "Trial tracker switched off for this character. It does nothing until you enable it again from this tab.",
-          "ok"
-        );
-        const p = document.getElementById("stl-settings-enabled"); // keep the popup in sync
-        if (p) p.checked = enable;
-      });
-
-      stlPanel.querySelector("#stlt-reset").addEventListener("click", () => {
-        if (!window.confirm(
-          "Reset to default?\n\nThis clears everything the Trial Tracker stored in this browser (API base, character ID/name, button/panel positions, saved levels, auto-sync state) — like a fresh install. Your ledger data on the website is NOT touched."
-        )) return;
-        const count = resetToDefaults();
-        const resolved = resolveCharacter();
-        const idInput = stlPanel.querySelector("#stlt-characterId");
-        const nameInput = stlPanel.querySelector("#stlt-characterName");
-        if (idInput) idInput.value = resolved.characterId == null ? "" : resolved.characterId;
-        if (nameInput) nameInput.value = resolved.characterName == null ? "" : resolved.characterName;
-        // v1.37.0: the reset may have cleared THIS character's off state —
-        // repaint so the tab shows the correct (enabled) controls.
-        refreshTabSettingsUi();
-        setTabStatus(`Reset to default \u2014 cleared ${count} stored values. Fresh-install state.`, "ok");
       });
 
       // Paint the stored values — and the per-character switch state
