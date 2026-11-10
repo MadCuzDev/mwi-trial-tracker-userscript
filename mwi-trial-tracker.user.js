@@ -657,6 +657,15 @@
   //      guild roster's "Push to ledger" (any member of the guild can
   //      send it; the server enforces membership — the site's old
   //      "Snapshot now" request round-trip is gone).
+  //
+  // Before EVERY push (regardless of trigger), each entry's member is
+  // verified against this client's current guild roster — the same
+  // guildCharacterMap / guildSharableCharacterMap data the live-roster
+  // push sends — so people who are no longer in the guild (left/kicked
+  // mid-week, or a transient sign-up wave that the game briefly listed)
+  // no longer show up on the History page. If the roster was never
+  // captured on this client, verification is impossible and entries pass
+  // through unfiltered (the push still goes out; see filterSnapshotToRoster).
   // ---------------------------------------------------------------------
   const SNAPSHOT_PUSH_COOLDOWN_MS = 3 * 60 * 1000; // rate-limits auto re-pushes
   const SNAPSHOT_STATS_REFRESH_MS = 2500; // wait for the get_guild_trial_stats answer
@@ -3436,7 +3445,12 @@
     if (s.pushInFlight || !s.weekKey) return;
     if (s.statuses.skilling !== "completed" || s.statuses.combat !== "completed") return;
     if (s.lastPushedWeekKey === s.weekKey) {
-      const richer = snapshotRichness(s.statRows, s.signups, s.trialLoadouts) > s.lastPushRichness;
+      // Compare what we would actually push (verified against the current
+      // guild roster — lastPushRichness is recorded from the filtered
+      // set) against what was last pushed, or it can loop on pushes of
+      // data that no longer contains the non-member entrants.
+      const toVerify = filterSnapshotToRoster(s.statRows, s.signups, s.trialLoadouts);
+      const richer = snapshotRichness(toVerify.rows, toVerify.signups, toVerify.loadouts) > s.lastPushRichness;
       // The per-trial tile values can advance even when the data COUNT is
       // flat (a tier/points bump after the first push) — a different
       // serialized set is also worth the re-push.
@@ -3839,8 +3853,12 @@
         }
       }
     }
-    // Server cap: 500 entries per push (~40 players x ~9 trials max).
-    return entries.slice(0, 500);
+    // No client-side cap: the push is the week's COMPLETE picture — the
+    // ledger replaces the week's stored rows with it (latest push wins) —
+    // so truncating the tail here would silently drop real members from
+    // the History page. The server's 20 MB body limit + 5000-entry cap
+    // are the runaway guards.
+    return entries;
   }
 
   function snapshotApiBase() {
@@ -3913,6 +3931,62 @@
     return out;
   }
 
+  // The character IDs this client currently knows as belonging to the
+  // guild — the same roster data (guildCharacterMap /
+  // guildSharableCharacterMap, unioned across the guild messages seen on
+  // this page load) that the live-roster push sends. When the roster was
+  // never captured yet, null: verification is impossible and entries
+  // must not be dropped.
+  function rosterIdSet() {
+    if (!Array.isArray(guildMembers) || guildMembers.length === 0) return null;
+    const set = new Set();
+    for (const m of guildMembers) {
+      const id = Number(m && m.characterId);
+      if (Number.isInteger(id) && id > 0) set.add(id);
+    }
+    return set;
+  }
+
+  // Drop anything in a snapshot that belongs to members the client's
+  // guild roster no longer knows: rows by their characterId, signups by
+  // their characterId key, loadouts by the "charId:kind" key. A `null`
+  // roster (never captured) passes everything through unchanged.
+  function filterSnapshotToRoster(rows, signups, loadouts) {
+    const roster = rosterIdSet();
+    if (roster === null) {
+      return { rows: rows, signups: signups, loadouts: loadouts, dropped: 0 };
+    }
+    const inRoster = (id) => {
+      const n = Number(id);
+      return Number.isInteger(n) && n > 0 && roster.has(n);
+    };
+    let dropped = 0;
+    const keptRows = [];
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        const id = row && row.characterId;
+        if (inRoster(id)) keptRows.push(row);
+        else dropped += 1;
+      }
+    }
+    const keptSignups = {};
+    if (signups && typeof signups === "object") {
+      for (const key of Object.keys(signups)) {
+        if (inRoster(key)) keptSignups[key] = signups[key];
+        else dropped += 1;
+      }
+    }
+    const keptLoadouts = {};
+    if (loadouts && typeof loadouts === "object") {
+      for (const key of Object.keys(loadouts)) {
+        // loadout keys are "<characterId>:<skilling|combat>"
+        if (inRoster(String(key).split(":")[0])) keptLoadouts[key] = loadouts[key];
+        else dropped += 1;
+      }
+    }
+    return { rows: keptRows, signups: keptSignups, loadouts: keptLoadouts, dropped: dropped };
+  }
+
   // Push one week's snapshot to the ledger. `buffer` is optional: when
   // omitted the LIVE capture state (this week) goes up, after a
   // best-effort get_guild_trial_stats refresh (see above); a rollover
@@ -3951,6 +4025,18 @@
       }
       const trialStatsWire = serializeTrialStats(trialStats);
       console.log(`[STL] snapshot push ${weekKey} (${o.reason || "auto"}): rows=${rows.length}, signups=${Object.keys(signups).length}, loadouts=${Object.keys(loadouts).length}, trialStats=${trialStatsWire.length}, statsUpdated=${trialsSnapshot.statListUpdatedAt || "never"}`);
+      // Verify every entrant is still in the guild before sending: someone
+      // who left (or was kicked) mid-week should not keep showing up on the
+      // History page. Same roster source as the live-roster push — if this
+      // client never captured one, filterSnapshotToRoster passes everything
+      // through unchanged.
+      const verified = filterSnapshotToRoster(rows, signups, loadouts);
+      rows = verified.rows;
+      signups = verified.signups;
+      loadouts = verified.loadouts;
+      if (verified.dropped > 0) {
+        console.log(`[STL] snapshot push ${weekKey}: excluded ${verified.dropped} entr(y/ies) not found in the live guild roster`);
+      }
       const entries = buildSnapshotEntries(rows, signups, weekKey, loadouts);
       if (entries.length === 0 && trialStatsWire.length === 0) {
         return "No participant or signup data for " + weekKey + " — nothing to snapshot.";
@@ -3958,15 +4044,18 @@
       const res = await gmRequest("POST", `${apiBase}/api/trial-snapshots`, { weekKey, entries, trialStats: trialStatsWire });
       if (res.status === 200) {
         let upserted = entries.length;
+        let cleared = 0;
         try {
           const p = JSON.parse(res.responseText);
           if (p && Number.isFinite(Number(p.upserted))) upserted = Number(p.upserted);
-        } catch (e) { /* keep the local count */ }
+          if (p && Number.isFinite(Number(p.cleared))) cleared = Number(p.cleared);
+        } catch (e) { /* keep the local counts */ }
         trialsSnapshot.lastPushedWeekKey = weekKey;
         trialsSnapshot.lastPushAt = Date.now();
         trialsSnapshot.lastPushRichness = snapshotRichness(rows, signups, loadouts);
         trialsSnapshot.lastPushTrialStats = JSON.stringify(trialStatsWire);
-        const okMsg = `Snapshot pushed: ${upserted} entries for ${weekKey} (${o.reason || "auto"}).`;
+        const okMsg = `Snapshot pushed: ${upserted} entries for ${weekKey} (${o.reason || "auto"}).` +
+          (cleared > 0 ? ` Cleared ${cleared} stale stored entr(y/ies) the latest week push no longer lists.` : "");
         console.log("[STL] " + okMsg);
         return okMsg;
       }
