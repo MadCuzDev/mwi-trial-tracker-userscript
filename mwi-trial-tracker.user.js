@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MWI Trial Tracker
 // @namespace    http://tampermonkey.net/
-// @version      1.37.0
+// @version      1.37.1
 // @description  Tracks and optimizes trials  on milkywayidle.
 // @author       MadCuzDev, Rhohydronian
 // @match        https://www.milkywayidle.com/*
@@ -11,6 +11,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_listValues
 // @grant        GM_registerMenuCommand
 // @grant        GM_addStyle
 // @grant        unsafeWindow
@@ -118,6 +119,37 @@
       /* ignore */
     }
   }
+  // v1.37.1: "Reset to default" backstop — delete EVERY key this script
+  // could ever hold in the localStorage mirror, whatever it is. Every
+  // persist goes through localSet (via stlSetValue), which always uses
+  // LOCAL_STORAGE_PREFIX, so a prefix sweep stays complete without ever
+  // touching a key list — and can never touch a key of the page or of
+  // another script. Returns the number of keys removed.
+  function clearLocalMirror() {
+    const ls = pageLocalStorage();
+    if (!ls) return 0;
+    let removed = 0;
+    try {
+      // Snapshot the doomed keys first — removeItem invalidates the
+      // length-based enumeration mid-loop otherwise.
+      const doomed = [];
+      for (let i = 0; i < ls.length; i++) {
+        const k = ls.key(i);
+        if (k && k.indexOf(LOCAL_STORAGE_PREFIX) === 0) doomed.push(k);
+      }
+      doomed.forEach((k) => {
+        try {
+          ls.removeItem(k);
+          removed++;
+        } catch (e) {
+          /* one bad key must not abort the sweep */
+        }
+      });
+    } catch (e) {
+      /* localStorage unavailable — the GM store still got cleared */
+    }
+    return removed;
+  }
   // Read a persisted value from the localStorage mirror first, then from GM
   // storage. `def` is returned only when neither source has a value. (On the
   // Android app the GM copy is wiped on every relaunch, so the mirror is the
@@ -159,7 +191,7 @@
   // the @version metadata above — bump BOTH on every release (even tiny ones;
   // the third digit is for super-small changes), or the member list will show
   // the wrong "latest" comparison.
-  const SCRIPT_VERSION = "1.37.0";
+  const SCRIPT_VERSION = "1.37.1";
 
   // All 17 MWI skills: the 10 skilling skills plus the 7 combat stats.
   // `icon` is rendered next to each skill in the roster overlay header and
@@ -607,10 +639,11 @@
   let pullState = { running: false, paused: false, fetched: 0, total: 0, aborted: false };
   let overlayEl = null;
   let overlayBuilt = false;
-  // v1.37.x: quiet background-run tracking. While the roster panel is tucked
-  // into its floating pill, the pill mirrors progress for any running
-  // action; `loadoutsAck` keeps the pill up with the burst's completion
-  // summary until the user restores the panel.
+  // v1.37.x: quiet background-run tracking. While the roster panel is
+  // tucked into its floating pill (manually — the buttons no longer
+  // auto-tuck it), the pill mirrors progress for any running action;
+  // `loadoutsAck` keeps the pill up with the burst's completion summary
+  // until the user restores the panel.
   let overlayState = {
     minimized: false,
     loadouts: { running: false, done: 0, total: 0, captured: 0 },
@@ -652,9 +685,9 @@
   //      the last chance for the old data);
   //   2. completed — once both of this week's trials report "completed",
   //      the final state lands within minutes of the last trial;
-  //   3. manual    — the panel's "Push Snapshot" button: a direct
+  //   3. manual    — the roster panel's "Push Trials" button: a direct
   //      guild-gated push from this in-game client, exactly like the
-  //      guild roster's "Push to ledger" (any member of the guild can
+  //      guild roster's "Push Members" (any member of the guild can
   //      send it; the server enforces membership — the site's old
   //      "Snapshot now" request round-trip is gone).
   //
@@ -669,6 +702,14 @@
   // ---------------------------------------------------------------------
   const SNAPSHOT_PUSH_COOLDOWN_MS = 3 * 60 * 1000; // rate-limits auto re-pushes
   const SNAPSHOT_STATS_REFRESH_MS = 2500; // wait for the get_guild_trial_stats answer
+  // v1.37.1: trial-history (weekly snapshot) pushes are MANUAL-only for
+  // now — the roster overlay's "Push Trials" button is the only trigger
+  // that sends a week's snapshot to the ledger. The two automatic
+  // triggers (the old-week flush on week rollover, and the completion /
+  // re-login catch-up inside maybeCompletionSnapshot) stay implemented
+  // but disabled, so History rows never appear unless a member explicitly
+  // pushes. Flip to true to restore automatic snapshots.
+  const SNAPSHOT_AUTO_PUSH = false;
   let trialsSnapshot = {
     weekStartAt: null, // guild.currentWeekStartAt of the week being captured
     weekKey: null, // UTC date ("YYYY-MM-DD") the game's week starts (Friday 00:00 UTC reset)
@@ -1162,8 +1203,9 @@
     pullState.fetched = Object.keys(pulledProfiles).length;
     if (overlayEl && overlayEl.classList.contains("stl-overlay-open")) {
       renderOverlay();
-      // v1.37.0: a gear hover on this member may be open ("fetching…") —
-      // upgrade it to the real gear now that the profile arrived.
+      // v1.37.0: a gear hover on this member may be open showing
+      // "no gear captured yet" — upgrade it to the real gear now that
+      // the profile (from a full pull or our own init data) arrived.
       if (gearTipCid !== null) refreshGearTip();
     }
   }
@@ -1791,7 +1833,7 @@
     // Weekly trial snapshot (Trial History page): push when due — both of
     // this week's trials completed. Rollover captures fire immediately in
     // trackGuildTrialWeek, not here. The manual trigger is the panel's
-    // "Push Snapshot" button (direct guild-gated push, like the roster
+    // "Push Trials" button (direct guild-gated push, like the roster
     // push — there is no longer a site-side request round-trip).
     maybeCompletionSnapshot();
   }
@@ -2877,7 +2919,7 @@
   // Push the pulled roster to the ledger backend via POST /api/roster/sync.
   async function pushPulledRoster(apiBase) {
     const members = Object.values(pulledProfiles);
-    if (members.length === 0) return "Nothing to push — Pull members first.";
+    if (members.length === 0) return "Nothing to push — Pull Members first.";
     // Profiles already carry their numeric characterId when the payload
     // provided one; fall back to name matching against the captured roster
     // for the rare name-keyed entries.
@@ -3390,7 +3432,14 @@
     trialsSnapshot.trialProgress = {}; // captured values belong to the old week now
     for (const req of oldPending) { if (req.settle) req.settle(null); }
     trialsSnapshot.pendingViewLoadouts = [];
-    if (oldKey && (hasSnapshotData(oldRows, oldSignups) || Object.keys(oldProgress).length > 0)) {
+    // v1.37.1: the rollover flush is gated off while trial history is
+    // manual-only — a week nobody pushed during the week is not pushed
+    // automatically when it rolls over (see SNAPSHOT_AUTO_PUSH).
+    if (
+      SNAPSHOT_AUTO_PUSH &&
+      oldKey &&
+      (hasSnapshotData(oldRows, oldSignups) || Object.keys(oldProgress).length > 0)
+    ) {
       void pushTrialSnapshot(oldKey, {
         apiBase: snapshotApiBase(),
         buffer: { statRows: oldRows, signups: oldSignups, trialLoadouts: oldLoadouts, trialStats: oldProgress },
@@ -3441,6 +3490,9 @@
   // week already pushed re-pushes only when strictly richer data arrived
   // since (the server upserts, so this just refreshes the rows).
   function maybeCompletionSnapshot() {
+    // v1.37.1: the completion / re-login catch-up push is off while trial
+    // history is manual-only (see SNAPSHOT_AUTO_PUSH).
+    if (!SNAPSHOT_AUTO_PUSH) return;
     const s = trialsSnapshot;
     if (s.pushInFlight || !s.weekKey) return;
     if (s.statuses.skilling !== "completed" || s.statuses.combat !== "completed") return;
@@ -3676,12 +3728,17 @@
     const stored = normalizeTrialLoadoutResponse(req.characterId, req.kind, lo, req.name);
     trialsSnapshot.trialLoadouts[req.characterId + ":" + req.kind] = stored;
     console.log(`[STL] captured trial loadout: ${(stored.name || "member " + req.characterId)} (${req.kind}, ${stored.equipment.length} gear)`);
+    // A tooltip may be open on this member — refresh it in place so the
+    // new trial section appears live as each capture settles.
+    try {
+      if (gearTipCid === req.characterId) refreshGearTip();
+    } catch (e) { /* UI-only refresh */ }
     req.settle(lo);
   }
 
   // Burst: fetch the signed-up loadout for every (member, kind) pair
   // signed up this week that we don't have cached yet. Invoked from the
-  // roster overlay's "⚙ Trial Loadouts" button (manual by design) — a pass
+  // roster overlay's "Pull Trials" button (manual by design) — a pass
   // only pays for what's missing (cached pairs are skipped). Sequential,
   // one request per second (TRIAL_LOADOUT_FETCH.gapMs) so a full roster
   // takes a few minutes; the name-matched FIFO still tolerates slow
@@ -4011,8 +4068,8 @@
         // arrives, so a pre-await reference would be stale/empty.
         rows = trialsSnapshot.statRows;
         signups = trialsSnapshot.signups;
-        // Trial loadouts are fetched ONLY by the roster overlay's "⚙ Trial
-        // Loadouts" button (manual by design — no burst is ever fired as a
+        // Trial loadouts are fetched ONLY by the roster overlay's "Pull
+        // Trials" button (manual by design — no burst is ever fired as a
         // side effect of a push); whatever the button cached this week
         // rides along here.
         loadouts = trialsSnapshot.trialLoadouts;
@@ -4075,7 +4132,7 @@
   // (site button arms a request → this client's sweep polled it and
   // dispatched the push) is gone — snapshots now go out exactly like the
   // guild roster does: rollover/completion fire automatically, and a
-  // member's panel "Push Snapshot" button sends a direct guild-gated push
+  // member's panel "Push Trials" button sends a direct guild-gated push
   // (see buildPanel). No meta-poll of the ledger remains.
 
   function captureCombatTrials(msg) {
@@ -4227,7 +4284,7 @@
   async function pushPulledProfiles(apiBase) {
     const entries = Object.values(pulledProfilesFull).filter((p) => p && p.characterId !== null);
     if (entries.length === 0) {
-      return "No full profiles captured — Pull members first (or reload so our own profile is captured).";
+      return "No full profiles captured — Pull Members first (or reload so our own profile is captured).";
     }
     const profiles = {};
     for (const p of entries) {
@@ -4728,7 +4785,9 @@
     }
     #stl-overlay-toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
     #stl-ov-pull { background: linear-gradient(135deg, #667eea, #764ba2); }
-    #stl-ov-loadouts { background: #3a3f5c; }
+    /* Extra gap splits the toolbar into the roster group (left) and the
+       trial group (right); harmless if the buttons wrap on a narrow panel. */
+    #stl-ov-loadouts { background: #3a3f5c; margin-left: 20px; }
     #stl-ov-push-snapshot { background: #1f6f43; }
     #stl-ov-pause { background: #33344a; }
     #stl-ov-pause.stl-paused { background: #c0392b; }
@@ -4784,6 +4843,11 @@
     #stl-gear-tip .stl-gt-item { color: #e8eaf3; }
     #stl-gear-tip .stl-gt-enh { color: #79c0ff; font-weight: 600; font-size: 11px; margin-left: 4px; }
     #stl-gear-tip .stl-gt-note { margin-top: 8px; color: #888aa5; font-size: 11.5px; font-style: italic; }
+    /* The "Pull Trials" capture: this week's signed-up loadout(s). */
+    #stl-gear-tip .stl-gt-trial { margin-top: 8px; padding-top: 6px; border-top: 1px solid #2b2d40; }
+    #stl-gear-tip .stl-gt-trial-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; }
+    #stl-gear-tip .stl-gt-trial-kind { font-weight: 600; color: #ffd700; }
+    #stl-gear-tip .stl-gt-cons { color: #9fe8b0; }
     #stl-overlay-empty { padding: 24px; text-align: center; color: #7d7f97; font-size: 12.5px; white-space: pre-line; }
     #stl-overlay-footer {
       padding: 10px 18px; border-top: 1px solid rgba(255,255,255,0.12);
@@ -4873,10 +4937,10 @@
                 : `Pulling ${pullState.fetched}/${pullState.total}…`;
             } else if (lo.running) {
               pillStatus.textContent = lo.total > 0
-                ? `⚙ Fetching loadouts ${lo.done}/${lo.total}…`
-                : `⚙ Fetching loadouts… ${lo.done} requested`;
+                ? `Fetching loadouts ${lo.done}/${lo.total}…`
+                : `Fetching loadouts… ${lo.done} requested`;
             } else {
-              pillStatus.textContent = `⚙ ${lo.captured} trial loadouts fetched`;
+              pillStatus.textContent = `${lo.captured} trial loadouts fetched`;
             }
       }
     }
@@ -4917,7 +4981,13 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       .filter((m) => !filter || m.characterName.toLowerCase().includes(filter))
       .map((m) => {
         const p = pulledProfiles[m.characterId] || pulledProfiles[m.characterName];
-        const missing = !p;
+        // A "Pull Trials" capture counts as captured data too: a member
+        // whose trial loadout was fetched gets the same full-bright row
+        // as a pulled profile, even if no full profile was ever pulled
+        // (the skill columns then just show "–" — hover the name for the
+        // trial loadout details).
+        const tl = weekTrialLoadouts(m.characterId);
+        const missing = !p && !tl.skilling && !tl.combat;
         // The game's own total already sums skilling + combat (verified against
         // the guild export), so prefer it. When it's absent, fall back to the
         // sum of every captured level — SKILLS now includes the combat stats,
@@ -5005,21 +5075,24 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
   //   - ensureItemNameMap() — the game's itemDetailMap, for names;
   //   - trialsSnapshot.signups[cid] — this week's signups, to tag which
   //     loadout actually ran the trials.
-  // When the member's profile wasn't pulled yet, hovering fires a single
-  // on-demand view_profile request (the same one "Pull members" uses) and
-  // the tooltip upgrades to the real gear as soon as the game answers.
+  // Enhancement levels shown for SAVED loadouts are the ones the game
+  // ACTUALLY equips: its default "use highest enhancement level" mode runs
+  // the best copy the member owns, which can be higher than the level the
+  // loadout reference was written at (the site's gear menus apply the same
+  // rule); loadouts with the game's "use exact enhancement level" checkbox
+  // show the level as written. Trial-section levels come from the game's
+  // own trial-loadout answer and are already resolved.
+  // Hovering never triggers a fetch: the tooltip only shows what
+  // "Pull Members" (full gear) and "Pull Trials" (this week's
+  // signed-up loadouts) have already captured — an on-demand per-member
+  // fetch used to fire here and was removed (it made hover traffic hit
+  // the game socket). When nothing is captured yet the tip says so and
+  // points at the two toolbar buttons.
   // ---------------------------------------------------------------------
   let gearTipEl = null; // tooltip node (lazy)
   let gearTipCid = null; // member id the tooltip is showing (null = hidden)
   let gearTipTimer = null; // hover-dwell timer
   let gearTipXY = null; // last known cursor position [x, y] — the tip shows at it
-  const gearFetchInFlight = new Set(); // member ids with a fetch running
-
-  function hasMemberGear(cid) {
-    const prof =
-      pulledProfilesFull[cid] || pulledProfilesFull[String(cid)] || null;
-    return !!(prof && Array.isArray(prof.loadouts) && prof.loadouts.length > 0);
-  }
 
   function ensureGearTipEl() {
     if (gearTipEl) return gearTipEl;
@@ -5063,25 +5136,146 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     return tags;
   }
 
-  // Tooltip body for one member. `state`: undefined = normal data view,
-  // "fetching" = an on-demand pull is in flight, "none" = nothing fetched.
-  function buildGearTipHtml(member, state) {
+  // This member's captured signed-up TRIAL loadouts (the Pull Trials
+  // fetch), kind -> normalized loadout; `null` = not captured on this
+  // client yet. Independent of a profile pull: a member whose profile
+  // was never pulled can still have a captured trial loadout, which is
+  // exactly what this lets the roster overlay show for them.
+  function weekTrialLoadouts(cid) {
+    const out = {};
+    const cache = trialsSnapshot.trialLoadouts;
+    if (cache && typeof cache === "object") {
+      for (const kind of ["skilling", "combat"]) {
+        const lo = cache[cid + ":" + kind] || cache[String(cid) + ":" + kind];
+        if (lo && typeof lo === "object") out[kind] = lo;
+      }
+    }
+    return out;
+  }
+
+  // The tooltip's "This week's trial loadouts" section: per signed-up
+  // kind, the gear per slot (item name + enhancement), the loadout's
+  // equipped abilities, and combat consumables.
+  function buildTrialTipSections(cid) {
+    const trials = weekTrialLoadouts(cid);
+    if (!trials.skilling && !trials.combat) return "";
+    const names = ensureItemNameMap();
+    const itemName = (hrid) => {
+      const d = names[hrid];
+      return (d && typeof d.name === "string" && d.name)
+        || String(hrid).split("/").pop().replace(/_/g, " ");
+    };
+    let html = `<div class="stl-gt-note">This week's trial loadouts (Pull Trials)</div>`;
+    for (const kind of ["skilling", "combat"]) {
+      const lo = trials[kind];
+      if (!lo) continue;
+      let rows = "";
+      for (const eq of lo.equipment || []) {
+        if (!eq || !eq.itemHrid) continue;
+        const enh = typeof eq.enhancementLevel === "number" && eq.enhancementLevel > 0
+          ? `<span class="stl-gt-enh">+${eq.enhancementLevel}</span>`
+          : "";
+        rows += `<div class="stl-gt-row">` +
+          `<span class="stl-gt-slot">${escapeHtml(gearLabel(eq.slotType) || gearLabel(eq.slot) || String(eq.slot || "Item"))}</span>` +
+          `<span class="stl-gt-item">${escapeHtml(itemName(eq.itemHrid))}${enh}</span></div>`;
+      }
+      for (const a of lo.abilities || []) {
+        if (!a || !a.abilityHrid) continue;
+        rows += `<div class="stl-gt-row">` +
+          `<span class="stl-gt-slot">Ability</span>` +
+          `<span class="stl-gt-item">${escapeHtml(abilityTail(a.abilityHrid))}${a.level > 0 ? ` <b>Lv${a.level}</b>` : ""}</span></div>`;
+      }
+      for (const c of lo.consumables || []) {
+        if (!c || !c.itemHrid) continue;
+        const enh = typeof c.enhancementLevel === "number" && c.enhancementLevel > 0
+          ? `<span class="stl-gt-enh">+${c.enhancementLevel}</span>`
+          : "";
+        rows += `<div class="stl-gt-row">` +
+          `<span class="stl-gt-slot">Consumable</span>` +
+          `<span class="stl-gt-item stl-gt-cons">${escapeHtml(itemName(c.itemHrid))}${(c.count > 1 ? " ×" + c.count : "")}${enh}</span></div>`;
+      }
+      const kindLabel = kind.charAt(0).toUpperCase() + kind.slice(1);
+      const head = `<span class="stl-gt-trial-kind">⚙ ${kindLabel}</span>` +
+        (lo.actionTypeHrid ? `<span class="stl-gt-lo-skill">${escapeHtml(gearLabel(lo.actionTypeHrid))}</span>` : "");
+      html += `<div class="stl-gt-trial"><div class="stl-gt-trial-head">${head}</div>` +
+        (rows || `<div class="stl-gt-note">signed up, but the loadout was captured as empty</div>`) +
+        `</div>`;
+    }
+    return html;
+  }
+
+  // Highest enhancement level the member OWNS of each item, from the raw
+  // captured profile (their every item instance + their current gear) —
+  // mirrors the site-side menus (server/lib/trial-stats.js
+  // buildMaxOwnedMap, public/combat.js maxOwnedEnhancementLevels).
+  // Returns {} when neither source is present (nothing to resolve).
+  function maxOwnedEnhancementLevels(raw) {
+    const map = {};
+    if (!raw || typeof raw !== "object") return map;
+    const bump = (itemHrid, level) => {
+      if (!itemHrid) return;
+      const lvl = Math.max(0, Math.floor(Number(level) || 0));
+      if (lvl > (map[itemHrid] || -1)) map[itemHrid] = lvl;
+    };
+    const items = raw.characterItems;
+    if (items && typeof items === "object") {
+      for (const it of Object.values(items)) {
+        if (!it || typeof it !== "object") continue;
+        if (typeof it.hash === "string") {
+          const p = it.hash.split("::"); // charId, slot, itemHrid, level
+          if (p.length >= 4) bump(p[2], p[3]);
+        }
+        if (it.itemHrid && it.enhancementLevel != null) bump(it.itemHrid, it.enhancementLevel);
+      }
+    }
+    const wim = raw.wearableItemMap;
+    if (wim && typeof wim === "object") {
+      for (const it of Object.values(wim)) {
+        if (it && it.itemHrid) bump(it.itemHrid, it.enhancementLevel);
+      }
+    }
+    return map;
+  }
+
+  // Does a SAVED loadout use exact (as-written) enhancement levels? The
+  // in-game "use highest enhancement level" checkbox is stored as
+  // useExactEnhancement on the raw characterLoadoutMap entry: false/absent
+  // = the game's default (equip the highest owned copy of each item),
+  // true = use the level written in the loadout reference. Saved references
+  // can point at an older, lower-level copy — which is why a tooltip that
+  // shows the as-written level disagrees with what the game (and the site's
+  // gear menus) actually run.
+  function loadoutUsesExactEnhancement(prof, lo) {
+    if (!prof || !lo || lo.loadoutId == null) return false;
+    const clm = prof.raw && prof.raw.characterLoadoutMap;
+    if (!clm || typeof clm !== "object") return false;
+    const rawLo = clm[String(lo.loadoutId)];
+    return !!(rawLo && typeof rawLo === "object" && rawLo.useExactEnhancement === true);
+  }
+
+  // Tooltip body for one member: renders whatever is already captured
+  // (hover never fetches — see the panel doc block).
+  function buildGearTipHtml(member) {
     const cid = member.characterId;
     let html = `<div class="stl-gt-name">${escapeHtml(member.characterName)} <span class="stl-gt-id">(#${cid})</span></div>`;
-    if (state === "fetching") {
-      html += `<div class="stl-gt-note">Fetching gear from the game…</div>`;
-      return html;
-    }
+    const trialSections = buildTrialTipSections(cid);
     const prof =
       pulledProfilesFull[cid] || pulledProfilesFull[String(cid)] || null;
     if (!prof || !Array.isArray(prof.loadouts) || prof.loadouts.length === 0) {
+      if (trialSections) {
+        // No full profile pulled, but "Pull Trials" cached this
+        // member's signed-up loadout(s) — show those.
+        html += `<div class="stl-gt-note">No full profile pulled — the captured trial loadouts are shown below.</div>`;
+        html += trialSections;
+        return html;
+      }
       // profile_shared carries hideWearableItems: when a member opts out of
       // gear sharing the wearableItemMap is empty/absent by design, so say
       // so instead of implying a capture failure.
       const hidden = !!(prof && prof.raw && prof.raw.hideWearableItems === true);
       html += hidden
         ? `<div class="stl-gt-note">This member has hidden their gear from other players.</div>`
-        : `<div class="stl-gt-note">No gear captured yet — use "Pull members" to fetch the roster's loadouts.</div>`;
+        : `<div class="stl-gt-note">No gear captured yet — use "Pull Members" (full gear) or "Pull Trials" (this week's trial loadouts).</div>`;
       return html;
     }
     const names = ensureItemNameMap();
@@ -5094,17 +5288,26 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       return 2;
     };
     const loadouts = prof.loadouts.slice().sort((a, b) => rank(a) - rank(b));
+    let maxOwned = null; // lazy: computed once, when a "highest"-mode saved loadout shows up
     for (const lo of loadouts) {
       const n = Number(lo.loadoutId) || 0;
+      // Live/synthesized loadouts (no loadoutId) and "exact" loadouts keep
+      // their as-written levels; a SAVED loadout in the game's default
+      // "use highest enhancement level" mode shows the best owned copy
+      // instead — the level the game actually equips (same rule as the
+      // site's gear menus).
+      const canBump = lo.loadoutId != null && !loadoutUsesExactEnhancement(prof, lo);
+      if (canBump && maxOwned === null) maxOwned = maxOwnedEnhancementLevels(prof.raw);
       let rows = "";
       for (const eq of lo.equipment || []) {
         if (!eq || !eq.itemHrid) continue;
         const d = names[eq.itemHrid];
         const name = (d && typeof d.name === "string" && d.name)
           || String(eq.itemHrid).split("/").pop().replace(/_/g, " ");
-        const enh = typeof eq.enhancementLevel === "number" && eq.enhancementLevel > 0
-          ? `<span class="stl-gt-enh">+${eq.enhancementLevel}</span>`
-          : "";
+        let enhLvl = typeof eq.enhancementLevel === "number" ? eq.enhancementLevel : 0;
+        if (canBump && maxOwned && maxOwned[eq.itemHrid] !== undefined
+            && maxOwned[eq.itemHrid] > enhLvl) enhLvl = maxOwned[eq.itemHrid];
+        const enh = enhLvl > 0 ? `<span class="stl-gt-enh">+${enhLvl}</span>` : "";
         rows += `<div class="stl-gt-row">` +
           `<span class="stl-gt-slot">${escapeHtml(gearLabel(eq.slot) || "Item")}</span>` +
           `<span class="stl-gt-item">${escapeHtml(name)}${enh}</span></div>`;
@@ -5123,6 +5326,10 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       html += `<div class="stl-gt-note">…${loadouts.length - 12} more loadout(s)</div>`;
       // (all loadouts still list above — the note is a length cue only)
     }
+    // The captured signed-up trial loadout(s) come last — they are a
+    // separate, this-week capture (Pull Trials), not part of the
+    // profile's full loadout set.
+    html += trialSections;
     return html;
   }
 
@@ -5143,10 +5350,9 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       return;
     }
     const tip = ensureGearTipEl();
-    const state = hasMemberGear(gearTipCid)
-      ? undefined
-      : (gearFetchInFlight.has(gearTipCid) ? "fetching" : "none");
-    tip.innerHTML = buildGearTipHtml(member, state);
+    // Gear is read-only now (no hover fetch) — the tip renders whatever a
+    // toolbar action already captured.
+    tip.innerHTML = buildGearTipHtml(member);
     const anchor = overlayEl.querySelector(`tr[data-stl-cid="${gearTipCid}"] > td.stl-col-name`);
     if (!anchor) {
       hideGearTip();
@@ -5199,20 +5405,6 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     gearTipTimer = setTimeout(hideGearTip, delay);
   }
 
-  // One-shot gear fetch for a hovered member (same view_profile request as
-  // "Pull members"). Skipped while a full pull runs (data is already
-  // arriving) and deduped per member.
-  function requestGearFetch(cid) {
-    if (pullState.running || gearFetchInFlight.has(cid) || hasMemberGear(cid) || !socketReady()) return;
-    const member = guildMembers.find((g) => g && g.characterId === cid);
-    if (!member) return;
-    gearFetchInFlight.add(cid);
-    requestMemberProfile(member).then(() => {
-      gearFetchInFlight.delete(cid);
-      if (gearTipCid === cid) refreshGearTip();
-    });
-  }
-
   function buildOverlay() {
     if (overlayBuilt || overlayEl) return overlayEl;
     overlayBuilt = true;
@@ -5231,25 +5423,26 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     const toolbar = document.createElement("div");
     toolbar.id = "stl-overlay-toolbar";
     toolbar.innerHTML = `
-      <button id="stl-ov-pull" type="button" title="Pull every guild member's live skill levels and equipped abilities">Pull members</button>
+      <button id="stl-ov-pull" type="button" title="Pull every guild member's live skill levels and equipped abilities">Pull Members</button>
       <button id="stl-ov-pause" type="button" title="Pause/Resume the pull" disabled>Pause</button>
-      <button id="stl-ov-push" type="button" title="Push the pulled roster to the ledger">Push to ledger</button>
+      <button id="stl-ov-push" type="button" title="Push the pulled roster to the ledger">Push Members</button>
       <!-- v1.37.0: trial-loadout capture lives in the roster toolbar (its
            "multi-use area" for everyone-in-the-guild actions) — the ONLY
            thing that asks the game for members' signed-up trial loadouts
            (one view_loadout per second; the full roster takes a few
            minutes). Cached results attach to the next snapshot push and
            show on the site's History page. v1.37.x: the run is quiet —
-           pressing this tucks the panel into the floating pill and the
-           burst runs in the background, locking only its own button. -->
-      <button id="stl-ov-loadouts" type="button" title="Fetch the signed-up trial loadouts of every guild member from the game (online or offline — one request per second, the full roster takes a few minutes). Runs quietly in the background: this panel tucks into the floating pill, which shows progress and the result.">&#9881; Trial Loadouts</button>
+           the panel stays open, progress reports in its footer, the burst
+           locks only its own button (and a manual minimize still tucks
+           it into the floating pill, which mirrors the same progress). -->
+      <button id="stl-ov-loadouts" type="button" title="Fetch the signed-up trial loadouts of every guild member from the game (online or offline — one request per second, the full roster takes a few minutes). Runs in the background; progress shows in the panel's footer (and in the floating pill if you minimize the panel).">Pull Trials</button>
       <!-- v1.37.0: manual mid-week snapshot push — direct and guild-
-           gated, the same way the roster's "Push to ledger" works (no
+           gated, the same way the roster's "Push Members" works (no
            site-side "Snapshot now" request). Runs the week's snapshot
            (stats + signups + any loadouts fetched by the button above)
            right now; auto-pushes still happen at the weekly rollover
            and once both trials complete. -->
-      <button id="stl-ov-push-snapshot" type="button" title="Push THIS week's trial snapshot (stats + signups + any fetched loadouts) to the site right now, like the roster push above. Guild members only — the ledger verifies your membership. Auto-pushes still happen at the weekly rollover and once both trials are completed.">&#9889; Push Snapshot</button>
+      <button id="stl-ov-push-snapshot" type="button" title="Push THIS week's trial snapshot (stats + signups + any fetched loadouts) to the site right now, like the roster push above. Guild members only — the ledger verifies your membership. Auto-pushes still happen at the weekly rollover and once both trials are completed.">Push Trials</button>
       <span id="stl-overlay-progress"></span>
       <input id="stl-ov-search" type="text" placeholder="Filter members…" />
     `;
@@ -5382,15 +5575,15 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     // panel into the roster toolbar (the "multi-use area" for
     // everyone-in-the-guild actions). This is the ONLY trigger for
     // view_loadout bursts (no auto-sweeps; pushes never gap-fill).
-    // v1.37.x: the run is quiet — pressing this tucks the roster panel
-    // into the floating progress pill (the game stays in front), the
-    // burst locks ONLY its own button (Pull / Push to ledger / Push
-    // Snapshot remain usable; a concurrent pull's unlock can't re-enable
-    // it mid-flight), and progress/summary surface in the pill:
-    // "⚙ Fetching loadouts x/y…" then "⚙ N trial loadouts fetched",
-    // which lingers until the panel is reopened (footer mirrors it).
+    // v1.37.x: the run is quiet — the panel stays open and progress
+    // surfaces in its footer (a manual minimize tucks it into the
+    // floating progress pill, which mirrors the same lines), the burst
+    // locks ONLY its own button (Pull Members / Push Members / Push
+    // Trials remain usable; a concurrent pull's unlock can't re-enable
+    // it mid-flight), and the completion summary ("⚙ N trial loadouts
+    // fetched") is remembered for the pill.
     // The cached loadouts ride along on the next snapshot push — the
-    // toolbar's "⚡ Push Snapshot" button (or the rollover / completion
+    // toolbar's "Push Trials" button (or the rollover / completion
     // auto-pushes) ships them to the site.
     overlay.querySelector("#stl-ov-loadouts").addEventListener("click", async () => {
       const btn = overlay.querySelector("#stl-ov-loadouts");
@@ -5398,17 +5591,14 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         overlayFooter("The game's socket isn't connected yet — rejoin the game, then press this again.", "err");
         return;
       }
-      // v1.37.x quiet background run: lock only this button (Pull / Push to
-      // ledger / Push Snapshot stay usable), tuck the panel into its
-      // floating pill so the game stays in front, and report progress in
-      // the pill (and the footer, if the panel is restored meanwhile).
+      // v1.37.x quiet background run: lock only this button (Pull Members /
+      // Push Members / Push Trials stay usable). The panel stays open —
+      // progress reports in its footer (a manual minimize still tucks it
+      // into the floating pill, which mirrors the same progress).
       btn.disabled = true;
       overlayState.loadouts = { running: true, done: 0, total: 0, captured: 0 };
       overlayState.loadoutsAck = false;
       overlayFooter("Fetching trial loadouts… (one member per second; a full roster takes a few minutes)", "");
-      overlayState.minimized = true;
-      overlay.classList.add("stl-overlay-minimized");
-      renderOverlay();
       try {
         const captured = await fetchWeekTrialLoadouts((done, total) => {
           overlayState.loadouts.done = done;
@@ -5420,8 +5610,8 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         overlayState.loadouts.running = false;
         overlayState.loadouts.captured = captured;
         if (captured > 0) {
-          // Linger in the pill with a summary so the background run's
-          // completion is visible without the big panel.
+          // Remember the summary in the pill (shown if the user minimizes
+          // or tucks the panel away; the open panel shows it in its footer).
           overlayState.loadoutsAck = true;
           renderOverlay();
           overlayFooter(`Fetched ${captured} trial loadout${captured === 1 ? "" : "s"} — ${stored} stored this week; they ship with the next snapshot push.`, "ok");
@@ -5438,13 +5628,19 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
         // meanwhile and left the toolbar locked — never steal that unlock.
         if (!pullState.running) btn.disabled = false;
         renderOverlay();
+        // Upgrade a tooltip currently open on a member in place with the
+        // burst's results (covers a tip opened after the last capture
+        // settled, which per-capture refreshes wouldn't see).
+        try {
+          if (gearTipCid !== null) refreshGearTip();
+        } catch (e) { /* UI-only refresh */ }
       }
     });
 
     // v1.37.0: manual mid-week snapshot push — the site's "Snapshot now"
     // request round-trip is gone, so this button is the manual path: a
     // DIRECT, guild-gated POST, exactly like this toolbar's roster
-    // "Push to ledger" (pushGuildGate gives early local feedback; the
+    // "Push Members" (pushGuildGate gives early local feedback; the
     // ledger's own membership check is authoritative server-side).
     // force:true skips the local "already pushed this week" guard, so
     // pressing it again (e.g. after a loadouts fetch) refreshes the rows
@@ -5494,10 +5690,11 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       if (!Number.isFinite(cid) || cid <= 0) return;
       gearTipXY = [event.clientX, event.clientY];
       if (gearTipTimer) { clearTimeout(gearTipTimer); gearTipTimer = null; }
+      // Purely display: dwell opens the tip for whatever is already
+      // captured — it never asks the game for anything.
       gearTipTimer = setTimeout(() => {
         gearTipTimer = null;
         showGearTip(cid);
-        requestGearFetch(cid);
       }, 140);
     });
     // Track the pointer while it is over name cells so the tip opens exactly
@@ -5582,14 +5779,34 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     }
   }
 
-  // v1.28.0: "Reset to default" — wipe everything the app wrote to GM
-  // storage (config, UI positions, detection cache, auto-sync cooldown,
-  // and every saved level) so the install behaves exactly like a fresh
-  // one. In-memory game detection is left alone: the game re-reports the
+  // v1.37.1: "Reset to default" — a FULL wipe of everything the app
+  // persists, so the install really behaves like a fresh one:
+  //   1. the userscript manager's key store (Tampermonkey): this script's
+  //      store is scoped to its name+namespace, so every key in it is ours.
+  //      When GM_listValues is granted and available, the store is
+  //      enumerated and EVERY key in it is deleted — any key a future
+  //      feature ever adds is wiped automatically, with no key-list change
+  //      in this code. Backends without GM_listValues (e.g. the Android
+  //      webview-gm bridge) get a static key manifest instead. Either way
+  //      the DELETE semantics matter: no stored value at all, so
+  //      GM_getValue returns the code default (storing null is NOT
+  //      equivalent: some backends hand the null back and it would shadow
+  //      DEFAULTS.apiBase).
+  //   2. the stl.* localStorage mirror: swept by prefix, whatever keys it
+  //      holds — they can only ever be written through localSet (via
+  //      stlSetValue), all with the stl. prefix, so the sweep stays
+  //      complete forever and can never touch a key of the page or of
+  //      another script. (On Android the bridge already deletes its GM
+  //      store on every app relaunch, so the mirror is what survives there
+  //      and the prefix sweep is the real wipe.)
+  // In-memory state is reset explicitly below: the game re-reports the
   // logged-in character on every init message, so the session keeps
-  // working. Returns the number of stored keys cleared.
-  function resetToDefaults() {
-    const baseKeys = [
+  // working. Returns the number of distinct keys cleared.
+  // v1.37.1: static manifest of every key this script persists — fallback
+  // for backends that don't expose GM_listValues. Keep in sync with the
+  // stlSetValue call sites.
+  function storedKeyManifest() {
+    const base = [
       "apiBase", "characterId", "characterName",
       "hideUpdateFab", "fabLocked", "fabPosition", "panelLocked",
       "panelPosition", "overlayPosition", "overlayPillPosition",
@@ -5601,13 +5818,35 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       "autoSyncLastAt", "autoSyncLastCharId",
       "stlDismissedUpdateVersion"
     ];
-    // DELETE the keys — that is what "fresh install" means (no stored value
-    // at all, so GM_getValue returns its default). Storing null instead is
-    // NOT equivalent: some backends hand the null back (or the string
-    // "null"), which would shadow DEFAULTS.apiBase and show up as the
-    // literal text "null" in the panel.
-    baseKeys.forEach((key) => clearStoredValue(key));
-    SKILLS.forEach((skill) => clearStoredValue(`level_${skill.id}`));
+    return base.concat(SKILLS.map((skill) => `level_${skill.id}`));
+  }
+  // v1.37.1: delete EVERY key in this script's userscript-manager store —
+  // full enumeration via GM_listValues when available (complete forever),
+  // static manifest otherwise. Returns the number of keys cleared.
+  function wipeGmStore() {
+    let keys = null;
+    if (typeof GM_listValues === "function") {
+      try {
+        keys = GM_listValues();
+      } catch (e) {
+        keys = null;
+      }
+    }
+    if (!Array.isArray(keys)) keys = storedKeyManifest();
+    let cleared = 0;
+    keys.forEach((key) => {
+      try {
+        clearStoredValue(key);
+        cleared++;
+      } catch (e) {
+        /* one unreadable key must not abort the sweep */
+      }
+    });
+    return cleared;
+  }
+  function resetToDefaults() {
+    const clearedKeys = wipeGmStore();
+    const clearedLocal = clearLocalMirror();
     // Also drop the in-memory auto-sync cooldown so the next game
     // (re)open re-arms the push like a fresh install would.
     autoSyncLastAt = 0;
@@ -5633,7 +5872,9 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     // so `wasOpen` reflects the post-reset UI.
     applyTrackerState();
     rebuildOpenPanel();
-    return baseKeys.length + SKILLS.length;
+    // GM store and mirror hold the same logical keys — report the larger
+    // sweep, not a double count.
+    return Math.max(clearedKeys, clearedLocal);
   }
 
   // Rebuild the panel (if one exists) so it reflects the cleared state —
@@ -5654,7 +5895,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     }
   }
 
-  const RESET_CONFIRM = "Reset to default?\n\nThis clears everything the Trial Tracker stored in this browser (API base, character ID/name, button/panel positions, saved levels, auto-sync state) — like a fresh install. Your ledger data on the website is NOT touched.";
+  const RESET_CONFIRM = "Reset to default?\n\nThis clears everything the Trial Tracker stored in this browser AND in the userscript manager's (Tampermonkey's) key store — settings, positions, saved levels, auto-sync state, everything. Like a fresh install. Your ledger data on the website is NOT touched.";
 
   // The Settings controls duplicated in two places (the popup's Settings
   // view: #stl-* ids, the in-game Settings tab: #stlt-* ids) — API base,
@@ -5766,7 +6007,7 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
       if (!window.confirm(RESET_CONFIRM)) return;
       const count = resetToDefaults();
       if (opts.afterReset) opts.afterReset();
-      set(`Reset to default \u2014 cleared ${count} stored values. Fresh-install state.`, "ok");
+      set(`Reset to default \u2014 cleared ${count} stored value${count === 1 ? "" : "s"}. Fresh-install state.`, "ok");
     });
   }
 
@@ -5814,8 +6055,8 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
           <button id="stl-roster" type="button" title="Pull / push the guild roster (cull lives on the website, admin only)">\uD83D\uDC65 Guild Roster</button>
         <!-- v1.37.0: the whole "guild-wide" action set moved into the
              guild roster overlay's toolbar (see buildOverlay) — its
-             multi-use area: the "⚙ Trial Loadouts" burst button AND the
-             manual mid-week "⚡ Push Snapshot" button (direct,
+             multi-use area: the "Pull Trials" burst button AND the
+             manual mid-week "Push Trials" button (direct,
              guild-gated, no site-side "Snapshot now" request). The panel
              keeps only Sync Character + Guild Roster. -->
         </div>
@@ -6251,8 +6492,8 @@ Open the in-game Guild panel once (or reload with the script active) so the memb
     });
 
     // v1.37.0: both guild-wide actions moved to the roster overlay
-    // toolbar — the "⚙ Trial Loadouts" button + handler and the manual
-    // "⚡ Push Snapshot" button + handler now live in buildOverlay()
+    // toolbar — the "Pull Trials" button + handler and the manual
+    // "Push Trials" button + handler now live in buildOverlay()
     // (the roster is the panel's multi-use area for everyone-in-the-
     // guild actions). The panel keeps Sync Character / Guild Roster.
 
