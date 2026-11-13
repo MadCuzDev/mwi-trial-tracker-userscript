@@ -1987,27 +1987,51 @@
     if (dot) dot.hidden = !outdated;
   }
 
+  // The canonical hosted ledger. Every client cross-checks this alongside
+  // the panel-configured apiBase, so a member whose apiBase is dead or
+  // points at a DIFFERENT ledger still hears about new script versions
+  // (their own ledger 404s / is unreachable, or was never deployed past the
+  // older build) — the in-game "update available" reminder keeps working
+  // and routes them to Greasy Fork instead of silently going stale.
+  const CANONICAL_API_BASE = "https://mwitrials.ddns.net";
+
   // Fetch the ledger's notion of the newest script version and update the
-  // reminder UI. Never throws: a transport failure or missing field just
-  // means "no reminder" (we only nag when we have a real newer version).
+  // reminder UI. Never throws: a transport failure or missing field on one
+  // source just means that source contributes nothing — the NEWER of the
+  // configured-base and canonical-base versions wins (on a tie the
+  // configured base wins, since it's consulted first), so one unreachable
+  // or out-of-date ledger can't silence a real "update available".
   async function checkForUpdate(apiBase) {
     if (updateFetchInFlight || !apiBase) return;
     updateFetchInFlight = true;
     try {
-      const res = await gmRequest("GET", `${apiBase}/api/config`);
-      if (res.status === 200) {
-        let body;
+      const bases = [apiBase];
+      if (CANONICAL_API_BASE !== apiBase) bases.push(CANONICAL_API_BASE);
+      let latest = null;
+      for (const base of bases) {
         try {
-          body = JSON.parse(res.responseText);
+          const res = await gmRequest("GET", `${base}/api/config`);
+          if (res.status === 200) {
+            let body;
+            try {
+              body = JSON.parse(res.responseText);
+            } catch (e) {
+              body = null;
+            }
+            const v =
+              body && typeof body.latestScriptVersion === "string"
+                ? body.latestScriptVersion
+                : null;
+            if (v && (latest == null || compareScriptVersions(v, latest) > 0)) {
+              latest = v;
+            }
+          }
         } catch (e) {
-          body = null;
-        }
-        if (body && typeof body.latestScriptVersion === "string") {
-          updateLatest = body.latestScriptVersion;
+          // This ledger is unreachable — try the next source (if the
+          // configured base is dead/wrong, the canonical one still nags).
         }
       }
-    } catch (e) {
-      // Unreachable — leave the current reminder state alone.
+      if (latest != null) updateLatest = latest;
     } finally {
       updateFetchInFlight = false;
       renderUpdateReminder();
